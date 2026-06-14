@@ -156,6 +156,160 @@ Fixed the long report cutoff.
         self.assertIn("Line 01: fixed report detail.", html)
         self.assertIn("Line 55: fixed report detail.", html)
 
+    def test_report_starts_at_what_changed(self) -> None:
+        raw = """OK
+
+The public repo scan is clean, and tests still pass.
+I'm committing and pushing the extraction fix now.
+
+What changed:
+
+- Added pane_feed_output().
+- Strips bottom composer/input area.
+
+Verification:
+
+- tests pass
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        text = herdres.item_plain_text(item)
+        self.assertEqual(item["title"], "What changed")
+        self.assertNotIn("I'm committing", text)
+        self.assertNotIn("The public repo scan", text)
+        self.assertIn("Added pane_feed_output", text)
+        self.assertIn("Verification", text)
+
+    def test_inline_changes_made_heading_wins_over_later_verification(self) -> None:
+        raw = """OK
+
+I'm committing and pushing now.
+
+Changes made in .local/bin/herdr_telegram_topics.py:520:
+
+- Preserves paragraphs as paragraphs.
+- Converts only real markdown bullets into rich lists.
+
+Verified with:
+
+- python3 -m py_compile
+- unittest
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        text = herdres.item_plain_text(item)
+        self.assertTrue(item["title"].startswith("Changes made in "))
+        self.assertNotEqual(item["title"], "Verified with")
+        self.assertNotIn("I'm committing", text)
+        self.assertIn("Preserves paragraphs as paragraphs.", text)
+        self.assertIn("python3 -m py_compile", text)
+
+    def test_verification_heading_does_not_drop_previous_deliverable_content(self) -> None:
+        raw = """Fixed the extraction issue.
+
+- Added heading slicing.
+
+Verified with:
+
+- tests pass
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "done"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        text = herdres.item_plain_text(item)
+        self.assertEqual(item["title"], "Update")
+        self.assertIn("Fixed the extraction issue.", text)
+        self.assertIn("tests pass", text)
+
+    def test_blank_lines_do_not_force_resend_migration(self) -> None:
+        clean = """What changed
+
+- Fixed extraction.
+
+Verification
+
+- tests pass
+"""
+
+        self.assertFalse(herdres.feed_text_has_ui_noise(clean))
+
+    def test_stable_status_hash_ignores_label_changes(self) -> None:
+        pane_a = {
+            "pane_id": "1",
+            "terminal_id": "t",
+            "workspace_id": "w",
+            "tab_id": "tab",
+            "agent": "claude",
+            "agent_status": "idle",
+            "label": "Brewed for 1m",
+        }
+        pane_b = dict(pane_a)
+        pane_b["label"] = "Brewed for 5m"
+
+        self.assertEqual(
+            herdres.status_hash(herdres.stable_status_object(pane_a)),
+            herdres.status_hash(herdres.stable_status_object(pane_b)),
+        )
+
+    def test_short_sync_json_is_noise(self) -> None:
+        raw = """Report
+
+{"changed": false, "message": "another sync is running", "ok": true}
+
+What changed:
+
+- Fixed extraction.
+"""
+
+        lines = herdres.clean_feed_lines(raw)
+        text = "\n".join(lines)
+
+        self.assertNotIn('"another sync is running"', text)
+        self.assertIn("Fixed extraction.", text)
+
+    def test_failed_feed_send_does_not_update_clean_hash(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_feed_output=Mock(return_value="What changed:\n\n- Fixed extraction."),
+            send_feed_item=Mock(return_value={"ok": False, "format": "rich", "error": "temporary"}),
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertNotIn("last_clean_hash", entry)
+        self.assertIn("temporary", entry.get("last_clean_send_error", ""))
+
     def test_pane_feed_output_tries_clean_sources_before_visible(self) -> None:
         calls: list[str] = []
 

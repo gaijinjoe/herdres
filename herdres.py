@@ -52,7 +52,7 @@ HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
-RICH_RENDER_VERSION = 4
+RICH_RENDER_VERSION = 5
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
@@ -360,6 +360,12 @@ def status_hash(obj: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def stable_status_object(pane: dict[str, Any]) -> dict[str, Any]:
+    obj = status_object(pane)
+    obj.pop("label", None)
+    return obj
+
+
 def pane_output(
     pane_id: str,
     *,
@@ -451,6 +457,18 @@ TOOL_CONTEXT_STATUS_PREFIXES = (
     "branch:",
 )
 
+PROCESS_OUTPUT_PREFIXES = (
+    "commit ",
+    "to https://",
+    "ls-remote ",
+    "--user is-enabled",
+    "telegram topics",
+)
+
+PROCESS_OUTPUT_EXACT = {
+    "enabled",
+}
+
 REPORT_MARKERS = (
     "done",
     "implemented",
@@ -464,6 +482,26 @@ REPORT_MARKERS = (
     "blocked",
     "waiting",
 )
+
+REPORT_PRIMARY_STARTS = {
+    "what changed",
+    "changes made",
+}
+
+REPORT_FALLBACK_STARTS = {
+    "summary",
+    "result",
+    "results",
+    "final",
+    "final status",
+    "verification",
+    "verified with",
+}
+
+REPORT_VERIFICATION_STARTS = {
+    "verification",
+    "verified with",
+}
 
 QUESTION_MARKERS = (
     "would you like",
@@ -547,7 +585,12 @@ def is_noise_line(line: str) -> bool:
         return True
     if re.fullmatch(r"[-=_./\\|: ]{4,}", low):
         return True
+    if low.startswith(("{", "[")) and low.endswith(("}", "]")):
+        if re.search(r'"(?:ok|changed|message|created|sent|panes)"\s*:', low):
+            return True
     if len(low) > 80 and low.startswith(("{", "[")) and low.endswith(("}", "]")):
+        return True
+    if low in PROCESS_OUTPUT_EXACT or any(low.startswith(prefix) for prefix in PROCESS_OUTPUT_PREFIXES):
         return True
     if " lines (ctrl +" in low or " to view transcript" in low:
         return True
@@ -631,6 +674,49 @@ def compact_block(lines: list[str], *, max_lines: int = 10, max_chars: int = 140
         selected.pop()
     text = "\n".join(selected[-max_lines:]).strip()
     return sanitize_text(text, max_chars=max_chars).strip()
+
+
+def heading_key(line: str) -> str:
+    clean = str(line or "").strip()
+    clean = re.sub(r"^\s*(?:[-*+\u2022]\s*)?", "", clean)
+    clean = clean.rstrip(":").strip()
+    return re.sub(r"\s+", " ", clean).lower()
+
+
+def is_report_primary_key(key: str) -> bool:
+    return key in REPORT_PRIMARY_STARTS or any(key.startswith(start + " ") for start in REPORT_PRIMARY_STARTS)
+
+
+def report_start_index(lines: list[str]) -> int | None:
+    for idx, line in enumerate(lines):
+        key = heading_key(line)
+        if is_report_primary_key(key):
+            return idx
+    for idx, line in enumerate(lines):
+        key = heading_key(line)
+        if key in REPORT_FALLBACK_STARTS:
+            if key in REPORT_VERIFICATION_STARTS and any(str(prev).strip() for prev in lines[:idx]):
+                continue
+            return idx
+    return None
+
+
+def slice_report_lines(lines: list[str]) -> list[str]:
+    idx = report_start_index(lines)
+    if idx is None:
+        return lines
+    return lines[idx:]
+
+
+def report_title_and_body(lines: list[str]) -> tuple[str, str]:
+    sliced = slice_report_lines(lines)
+    if sliced:
+        key = heading_key(sliced[0])
+        if is_report_primary_key(key) or key in REPORT_FALLBACK_STARTS:
+            title = sliced[0].strip().rstrip(":")
+            body_lines = sliced[1:]
+            return title, "\n".join(body_lines).strip()
+    return "Update", "\n".join(sliced).strip()
 
 
 def titled_feed_text(title: str, body: str) -> str:
@@ -1108,7 +1194,7 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
         or contains_marker(low_recent, QUESTION_MARKERS)
         or any(line.strip().endswith("?") for line in recent_lines[-4:])
     )
-    has_report = contains_marker(low_tail, REPORT_MARKERS)
+    has_report = contains_marker(low_tail, REPORT_MARKERS) or report_start_index(lines) is not None
 
     if has_question:
         return make_feed_item("question", "Question", tail, notify=True)
@@ -1116,7 +1202,8 @@ def extract_clean_feed_item(pane: dict[str, Any], entry: dict[str, Any], raw_tex
         heading = "Blocked" if status == "blocked" else "Error"
         return make_feed_item(status, heading, tail, notify=True)
     if has_report and status in {"done", "idle"}:
-        return make_feed_item("report", "Report", tail, notify=False)
+        title, body = report_title_and_body(lines)
+        return make_feed_item("report", title, body or tail, notify=False)
     return None
 
 
@@ -1135,7 +1222,31 @@ def clean_feed_hash(item: dict[str, Any]) -> str:
 
 
 def feed_text_has_ui_noise(text: str) -> bool:
-    return any(is_noise_line(line) for line in str(text or "").splitlines())
+    for raw in str(text or "").splitlines():
+        if not raw.strip():
+            continue
+        low = noise_key(raw)
+        if not low:
+            continue
+        if TOOL_START_RE.match(raw):
+            return True
+        if is_tui_status_noise(raw):
+            return True
+        if low.startswith((
+            "bash(",
+            "started task-",
+            "running in the background",
+            "tip: use /btw",
+            "brewed for",
+            "* brewed for",
+        )):
+            return True
+        if low in PROCESS_OUTPUT_EXACT or any(low.startswith(prefix) for prefix in PROCESS_OUTPUT_PREFIXES):
+            return True
+        if low.startswith(("{", "[")) and low.endswith(("}", "]")):
+            if re.search(r'"(?:ok|changed|message|created|sent|panes)"\s*:', low):
+                return True
+    return False
 
 
 def clear_clean_feed_state(entry: dict[str, Any]) -> None:
@@ -1145,6 +1256,7 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         "last_clean_text",
         "last_clean_item",
         "last_clean_sent_at",
+        "last_clean_send_error",
         "active_prompt",
         "awaiting_detail",
     ):
@@ -1777,11 +1889,12 @@ def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str,
 
 
 def should_send_status(entry: dict[str, Any], obj_hash: str, pane: dict[str, Any], new_entry: bool) -> bool:
+    status = str(pane.get("agent_status") or "").lower()
+    previous_status = str(entry.get("last_notified_status") or "").lower()
     if new_entry or not entry.get("last_status_hash"):
         return True
-    if entry.get("last_status_hash") != obj_hash:
+    if previous_status != status:
         return True
-    status = str(pane.get("agent_status") or "").lower()
     if status in {"blocked", "error"}:
         last_sent = entry.get("last_sent_at") or ""
         try:
@@ -1893,6 +2006,7 @@ def sync_once() -> dict[str, Any]:
             continue
         obj = status_object(pane)
         obj_hash = status_hash(obj)
+        stable_obj_hash = status_hash(stable_status_object(pane))
         if LIVE_CARD_ENABLED and sends < MAX_SENDS_PER_RUN and (
             not entry.get("card_message_id") or entry.get("card_status_hash") != obj_hash
         ):
@@ -1910,12 +2024,14 @@ def sync_once() -> dict[str, Any]:
                 item_hash = clean_feed_hash(item)
                 if sends < MAX_SENDS_PER_RUN and (old_clean_has_noise or item_hash != entry.get("last_clean_hash")):
                     reply_markup = None
+                    pending_active_prompt = None
+                    clear_active_prompt = False
                     if item.get("kind") == "choices":
                         options = list(item.get("options") or [])
                         prompt_id = str(item.get("prompt_id") or prompt_id_for(item_plain_text(item), options))
                         item["prompt_id"] = prompt_id
                         reply_markup = choices_reply_markup(prompt_id, options)
-                        entry["active_prompt"] = {
+                        pending_active_prompt = {
                             "id": prompt_id,
                             "text": item_plain_text(item),
                             "item": item,
@@ -1923,8 +2039,8 @@ def sync_once() -> dict[str, Any]:
                             "created_at": utc_now(),
                         }
                     else:
-                        entry.pop("active_prompt", None)
-                    send_feed_item(
+                        clear_active_prompt = True
+                    result = send_feed_item(
                         chat_id,
                         item,
                         telegram=telegram,
@@ -1932,18 +2048,27 @@ def sync_once() -> dict[str, Any]:
                         notify=bool(item.get("notify")),
                         reply_markup=reply_markup,
                     )
-                    sends += 1
-                    entry["last_clean_hash"] = item_hash
-                    entry["last_clean_kind"] = str(item.get("kind") or "")
-                    entry["last_clean_text"] = item_plain_text(item)
-                    entry["last_clean_item"] = item
-                    entry["last_clean_sent_at"] = utc_now()
-                    changed = True
+                    if result.get("ok"):
+                        sends += 1
+                        if pending_active_prompt:
+                            entry["active_prompt"] = pending_active_prompt
+                        elif clear_active_prompt:
+                            entry.pop("active_prompt", None)
+                        entry["last_clean_hash"] = item_hash
+                        entry["last_clean_kind"] = str(item.get("kind") or "")
+                        entry["last_clean_text"] = item_plain_text(item)
+                        entry["last_clean_item"] = item
+                        entry["last_clean_sent_at"] = utc_now()
+                        entry.pop("last_clean_send_error", None)
+                        changed = True
+                    else:
+                        entry["last_clean_send_error"] = sanitize_text(str(result), 500)
+                        changed = True
             elif old_clean_has_noise:
                 clear_clean_feed_state(entry)
                 changed = True
-            entry["last_status_hash"] = obj_hash
-        elif sends < MAX_SENDS_PER_RUN and should_send_status(entry, obj_hash, pane, new_entry):
+            entry["last_status_hash"] = stable_obj_hash
+        elif sends < MAX_SENDS_PER_RUN and should_send_status(entry, stable_obj_hash, pane, new_entry):
             pane_status = str(pane.get("agent_status") or "").lower()
             include_recent = pane_status in {"blocked", "unknown"}
             send_message(
@@ -1953,7 +2078,8 @@ def sync_once() -> dict[str, Any]:
                 notify=pane_status in {"blocked", "error"},
             )
             sends += 1
-            entry["last_status_hash"] = obj_hash
+            entry["last_status_hash"] = stable_obj_hash
+            entry["last_notified_status"] = pane_status
             entry["last_sent_at"] = utc_now()
             changed = True
 
