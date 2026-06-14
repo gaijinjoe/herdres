@@ -52,7 +52,7 @@ HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
-RICH_RENDER_VERSION = 2
+RICH_RENDER_VERSION = 3
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
@@ -65,6 +65,8 @@ SECRET_PATTERNS = [
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
     re.compile(r"(?i)([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)"),
 ]
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 class BridgeError(RuntimeError):
@@ -437,23 +439,29 @@ QUESTION_MARKERS = (
 
 
 def normalize_feed_line(line: str) -> str:
-    text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", line or "")
+    text = ANSI_RE.sub("", line or "").rstrip()
+    text = re.sub(r"^\s*[│┃]\s?", "", text)
     text = re.sub(r"[\u2500-\u257f]+", " ", text)
-    text = text.strip().lstrip(" \t-*>\u2022\u25cf\u25b8\u276f\u203a\u23bf\u273b\u23f5\u23f8").strip()
-    text = re.sub(r"\s+", " ", text)
     return sanitize_text(text, 500)
 
 
+def noise_key(line: str) -> str:
+    text = ANSI_RE.sub("", line or "")
+    text = re.sub(r"^\s*[│┃]\s?", "", text)
+    text = re.sub(r"[\u2500-\u257f]+", " ", text)
+    text = text.strip().lstrip(" \t-*>\u2022\u25cf\u25b8\u276f\u203a\u23bf\u273b\u23f5\u23f8").strip()
+    return re.sub(r"\s+", " ", text).lower()
+
+
 def is_noise_line(line: str) -> bool:
-    text = normalize_feed_line(line)
-    if not text:
-        return True
-    low = text.lower()
+    low = noise_key(line)
+    if not low:
+        return False
     if any(low.startswith(prefix) for prefix in NOISE_PREFIXES):
         return True
-    if re.fullmatch(r"[-=_./\\|: ]{4,}", text):
+    if re.fullmatch(r"[-=_./\\|: ]{4,}", low):
         return True
-    if len(text) > 80 and text.startswith(("{", "[")) and text.endswith(("}", "]")):
+    if len(low) > 80 and low.startswith(("{", "[")) and low.endswith(("}", "]")):
         return True
     if " lines (ctrl +" in low or " to view transcript" in low:
         return True
@@ -477,11 +485,13 @@ def is_noise_line(line: str) -> bool:
         "earning kickback",
     )):
         return True
-    if "plan mode on" in low and "·" in text:
+    if "plan mode on" in low and "·" in str(line or ""):
         return True
-    if "for agents" in low and ("·" in text or "\u2190" in text):
+    if "for agents" in low and ("·" in str(line or "") or "\u2190" in str(line or "")):
         return True
-    if "bypass permissions" in low and ("·" in text or "\u2190" in text or low.startswith("bypass permissions on")):
+    if "bypass permissions" in low and (
+        "·" in str(line or "") or "\u2190" in str(line or "") or low.startswith("bypass permissions on")
+    ):
         return True
     return False
 
@@ -490,10 +500,18 @@ def clean_feed_lines(text: str) -> list[str]:
     lines: list[str] = []
     for raw in (text or "").splitlines():
         clean = normalize_feed_line(raw)
+        if not clean.strip():
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
         if is_noise_line(clean):
             continue
         lines.append(clean)
-    return lines[-80:]
+    while lines and lines[0] == "":
+        lines.pop(0)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines[-120:]
 
 
 def option_match(line: str) -> re.Match[str] | None:
@@ -506,7 +524,11 @@ def prompt_id_for(text: str, options: list[dict[str, str]]) -> str:
 
 
 def compact_block(lines: list[str], *, max_lines: int = 10, max_chars: int = 1400) -> str:
-    selected = [ln for ln in lines if ln.strip()]
+    selected = [str(ln).rstrip() for ln in lines][-max_lines:]
+    while selected and not selected[0].strip():
+        selected.pop(0)
+    while selected and not selected[-1].strip():
+        selected.pop()
     text = "\n".join(selected[-max_lines:]).strip()
     return sanitize_text(text, max_chars=max_chars).strip()
 
@@ -519,9 +541,15 @@ def titled_feed_text(title: str, body: str) -> str:
 
 
 def feed_body_lines(title: str, body: str) -> list[str]:
-    lines = [ln.strip() for ln in str(body or "").splitlines() if ln.strip()]
-    if lines and lines[0].lower() == title.lower():
+    lines = [ln.rstrip() for ln in str(body or "").splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[0].strip().lower() == title.lower():
         lines = lines[1:]
+    while lines and not lines[0].strip():
+        lines.pop(0)
     return lines
 
 
@@ -586,10 +614,48 @@ def _numbered_text(line: str) -> tuple[int, str] | None:
     return int(match.group(1)), match.group(2).strip()
 
 
+def _split_path_section(line: str) -> tuple[str, str] | None:
+    clean = str(line or "").strip().rstrip(":")
+    match = re.match(
+        r"^(Changes made|Changed|Implemented|Updated|Modified|Edited|Touched)\s+(?:in|at)\s+(.+)$",
+        clean,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    title = match.group(1).strip()
+    title = title[:1].upper() + title[1:]
+    ref = match.group(2).strip().rstrip(":")
+    if not ref or not re.search(r"[/\\.]|:\d+$", ref):
+        return None
+    return title, ref
+
+
+def _is_codeish_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    return (
+        str(line or "").startswith(("    ", "\t"))
+        or stripped.startswith(("$ ", "# ", "./"))
+        or bool(re.match(r"^(python3?|pip3?|npm|pnpm|yarn|node|git|gh|curl|ssh|systemctl|journalctl|herdr)\b", stripped))
+        or bool(re.match(r"^[A-Z][A-Z0-9_]+=", stripped))
+    )
+
+
+def _rich_inline(value: str, max_chars: int = 500) -> str:
+    clean = str(value or "").strip()
+    if _is_codeish_line(clean):
+        return f"<code>{_html_text(clean, max_chars)}</code>"
+    return _html_text(clean, max_chars)
+
+
 def _looks_like_section(line: str, next_line: str | None = None) -> bool:
     clean = str(line or "").strip()
     if not clean or len(clean) > 80:
         return False
+    if _split_path_section(clean):
+        return True
     if clean.endswith(":"):
         return True
     if next_line and (_bullet_text(next_line) or _numbered_text(next_line)):
@@ -600,22 +666,30 @@ def _looks_like_section(line: str, next_line: str | None = None) -> bool:
 
 def _limited_lines(value: str | list[str], *, max_chars: int, max_lines: int = 30) -> tuple[list[str], list[str]]:
     if isinstance(value, list):
-        raw_lines = [str(ln).strip() for ln in value]
+        raw_lines = [str(ln).rstrip() for ln in value]
     else:
-        raw_lines = [ln.strip() for ln in str(value or "").splitlines()]
+        raw_lines = [ln.rstrip() for ln in str(value or "").splitlines()]
     lines: list[str] = []
     overflow: list[str] = []
     used = 0
+    content_count = 0
     for raw in raw_lines:
-        if not raw:
+        clean = sanitize_text(raw, 500).rstrip()
+        if not clean.strip():
+            if lines and lines[-1] != "":
+                lines.append("")
             continue
-        clean = sanitize_text(raw, 500)
         next_len = used + len(clean) + 1
-        if len(lines) >= max_lines or next_len > max_chars:
+        if content_count >= max_lines or next_len > max_chars:
             overflow.append(clean)
             continue
         lines.append(clean)
+        content_count += 1
         used = next_len
+    while lines and lines[0] == "":
+        lines.pop(0)
+    while lines and lines[-1] == "":
+        lines.pop()
     return lines, overflow
 
 
@@ -627,6 +701,10 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
     idx = 0
     while idx < len(lines):
         line = lines[idx]
+        if not line.strip():
+            idx += 1
+            continue
+
         bullet = _bullet_text(line)
         if bullet:
             items: list[str] = []
@@ -634,9 +712,28 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
                 item = _bullet_text(lines[idx])
                 if not item:
                     break
-                items.append(f"<li>{_html_text(item, 500)}</li>")
                 idx += 1
-            parts.append("<ul>\n" + "\n".join(items) + "\n</ul>")
+                while idx < len(lines):
+                    continuation = lines[idx]
+                    if (
+                        not continuation.strip()
+                        or _bullet_text(continuation)
+                        or _numbered_text(continuation)
+                        or (
+                            not continuation.startswith((" ", "\t"))
+                            and _looks_like_section(continuation, lines[idx + 1] if idx + 1 < len(lines) else None)
+                        )
+                    ):
+                        break
+                    if not continuation.startswith((" ", "\t")) and item.rstrip().endswith((".", "!", "?")):
+                        break
+                    item = f"{item.rstrip()} {continuation.strip()}"
+                    idx += 1
+                items.append(item)
+            if len(items) == 1:
+                parts.append(_rich_paragraph(items[0]))
+            else:
+                parts.append("<ul>\n" + "\n".join(f"<li>{_rich_inline(item, 500)}</li>" for item in items) + "\n</ul>")
             continue
 
         numbered = _numbered_text(line)
@@ -646,29 +743,71 @@ def _rich_structured_block(value: str | list[str], *, max_chars: int = MAX_RICH_
                 item = _numbered_text(lines[idx])
                 if not item:
                     break
+                number, text = item
                 numbered_items.append(item)
                 idx += 1
+                while idx < len(lines):
+                    continuation = lines[idx]
+                    if (
+                        not continuation.strip()
+                        or _bullet_text(continuation)
+                        or _numbered_text(continuation)
+                        or (
+                            not continuation.startswith((" ", "\t"))
+                            and _looks_like_section(continuation, lines[idx + 1] if idx + 1 < len(lines) else None)
+                        )
+                    ):
+                        break
+                    if not continuation.startswith((" ", "\t")) and text.rstrip().endswith((".", "!", "?")):
+                        break
+                    text = f"{text.rstrip()} {continuation.strip()}"
+                    numbered_items[-1] = (number, text)
+                    idx += 1
             numbers = [num for num, _ in numbered_items]
             if numbers == list(range(1, len(numbers) + 1)):
-                items = "\n".join(f"<li>{_html_text(text, 500)}</li>" for _, text in numbered_items)
+                items = "\n".join(f"<li>{_rich_inline(text, 500)}</li>" for _, text in numbered_items)
                 parts.append("<ol>\n" + items + "\n</ol>")
             else:
                 parts.extend(_rich_paragraph(f"{num}) {text}") for num, text in numbered_items)
             continue
 
+        if _is_codeish_line(line):
+            code_lines = [line.strip()]
+            idx += 1
+            while idx < len(lines) and _is_codeish_line(lines[idx]):
+                code_lines.append(lines[idx].strip())
+                idx += 1
+            code_text = _html_text("\n".join(code_lines), 1000)
+            parts.append(f"<pre><code>{code_text}</code></pre>")
+            continue
+
         next_line = lines[idx + 1] if idx + 1 < len(lines) else None
+        path_section = _split_path_section(line)
+        if path_section:
+            heading, ref = path_section
+            parts.append(f"<h4>{_html_text(heading, 100)}</h4>")
+            parts.append(f"<p><code>{_html_text(ref, 300)}</code></p>")
+            idx += 1
+            continue
+
         if _looks_like_section(line, next_line):
             parts.append(f"<h4>{_html_text(line.rstrip(':'), 100)}</h4>")
             idx += 1
             continue
 
-        paragraph = [line]
+        paragraph = [line.strip()]
         idx += 1
         while idx < len(lines):
             candidate = lines[idx]
-            if _bullet_text(candidate) or _numbered_text(candidate) or _looks_like_section(candidate, lines[idx + 1] if idx + 1 < len(lines) else None):
+            if (
+                not candidate.strip()
+                or _bullet_text(candidate)
+                or _numbered_text(candidate)
+                or _is_codeish_line(candidate)
+                or _looks_like_section(candidate, lines[idx + 1] if idx + 1 < len(lines) else None)
+            ):
                 break
-            paragraph.append(candidate)
+            paragraph.append(candidate.strip())
             idx += 1
         parts.append(_rich_paragraph(" ".join(paragraph)))
     return "\n".join(part for part in parts if part), overflow
@@ -893,11 +1032,13 @@ def choice_needs_detail(option: dict[str, str]) -> bool:
 
 
 def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[str, Any]:
-    buttons = [
-        {"text": str(opt.get("number") or idx + 1), "callback_data": f"herdr:c:{prompt_id}:{opt.get('number') or idx + 1}"}
-        for idx, opt in enumerate(options[:12])
-    ]
-    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    rows: list[list[dict[str, str]]] = []
+    for idx, opt in enumerate(options[:12], start=1):
+        number = str(opt.get("number") or idx)
+        label = re.sub(r"\s+", " ", str(opt.get("label") or "")).strip()
+        button_text = f"{number}. {label}" if label else number
+        rows.append([{"text": button_text[:64], "callback_data": f"herdr:c:{prompt_id}:{number}"}])
+    rows.append([{"text": "Custom reply", "callback_data": f"herdr:d:{prompt_id}:custom"}])
     return {"inline_keyboard": rows}
 
 
@@ -1904,21 +2045,48 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         return {"handled": True, "answer": "Not authorized.", "show_alert": True}
 
     parts = data.split(":")
-    if len(parts) != 4 or parts[1] != "c":
+    if len(parts) != 4 or parts[1] not in {"c", "d"}:
         return {"handled": True, "answer": "Unknown Herdr action."}
+    action = parts[1]
     prompt_id = parts[2]
     choice_number = parts[3]
     prompt = entry.get("active_prompt") if isinstance(entry.get("active_prompt"), dict) else {}
     if str(prompt.get("id") or "") != prompt_id:
         return {"handled": True, "answer": "Those choices are no longer active."}
     options = list(prompt.get("options") or [])
-    option = next((opt for opt in options if str(opt.get("number")) == choice_number), None)
-    if not option:
-        return {"handled": True, "answer": "Choice not found."}
 
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id or entry.get("last_known_status") == "closed":
         return {"handled": True, "answer": "This pane is no longer live.", "show_alert": True}
+
+    if action == "d":
+        entry["awaiting_detail"] = {
+            "user_id": user_id,
+            "prompt_id": prompt_id,
+            "choice": "",
+            "option": "custom",
+            "created_at": utc_now(),
+        }
+        save_state(state)
+        send_notice(
+            chat_id,
+            "Custom reply",
+            "Write the instruction to send to this pane.",
+            telegram=telegram,
+            thread_id=topic_id,
+            notify=True,
+            reply_markup={
+                "force_reply": True,
+                "selective": True,
+                "input_field_placeholder": "Instruction for this pane",
+            },
+            reply_to_message_id=message_id,
+        )
+        return {"handled": True, "answer": "Write the instruction in this topic."}
+
+    option = next((opt for opt in options if str(opt.get("number")) == choice_number), None)
+    if not option:
+        return {"handled": True, "answer": "Choice not found."}
 
     if choice_needs_detail(option):
         entry["awaiting_detail"] = {
@@ -1943,7 +2111,6 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
             },
             reply_to_message_id=message_id,
         )
-        save_state(state)
         return {"handled": True, "answer": "Write the details in this topic."}
 
     ok, detail = send_to_pane(pane_id, choice_number)
