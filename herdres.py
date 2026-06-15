@@ -62,7 +62,7 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
     "yes",
     "on",
 }
-RICH_RENDER_VERSION = 11
+RICH_RENDER_VERSION = 12
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "9000"))
@@ -1111,6 +1111,7 @@ def _rich_text_segment(value: str) -> str:
     parts.append(html.escape(text[pos:], quote=False).replace("`", ""))
     rendered = "".join(parts)
     rendered = re.sub(r"\*\*([^*\n]{1,300})\*\*", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"(?<!\*)\*([^*\n]{1,180})\*(?!\*)", r"<i>\1</i>", rendered)
     return rendered
 
 
@@ -1534,6 +1535,15 @@ TURN_KNOWN_HEADING_KEYS = {
 }
 
 
+def _plain_heading_title(value: str) -> str:
+    clean = str(value or "").strip()
+    clean = re.sub(r"`([^`\n]{1,300})`", r"\1", clean)
+    clean = re.sub(r"\*\*([^*\n]{1,300})\*\*", r"\1", clean)
+    clean = re.sub(r"(?<!\*)\*([^*\n]{1,180})\*(?!\*)", r"\1", clean)
+    clean = clean.strip(" -*_`")
+    return re.sub(r"\s+", " ", clean).strip()
+
+
 def _turn_heading_title(line: str) -> str:
     clean = re.sub(r"^\s{0,3}#{1,6}\s+", "", str(line or "").strip())
     clean = clean.rstrip(":").rstrip(".").strip()
@@ -1589,6 +1599,84 @@ def _rich_commit_line(line: str) -> str | None:
     if not match:
         return None
     return f"<p><code>{_html_text(match.group(1), 40)}</code> {_rich_inline(match.group(2), 500)}</p>"
+
+
+def _lead_heading_split(line: str) -> tuple[str, str] | None:
+    clean = str(line or "").strip()
+    match = re.match(r"^(.{8,100}?)\s+[—–]\s+(.+)$", clean)
+    if not match:
+        return None
+    raw_title = match.group(1).strip()
+    rest = match.group(2).strip()
+    meta_match = re.search(r"\s*\((`[^`\n]{1,120}`)\)\s*$", raw_title)
+    if meta_match:
+        raw_title = raw_title[:meta_match.start()].strip()
+        rest = f"{meta_match.group(1)} — {rest}"
+    title = _plain_heading_title(raw_title).rstrip(":").rstrip(".").strip()
+    words = title.split()
+    if not 2 <= len(words) <= 8:
+        return None
+    if title.lower() in {"yes", "no", "ok", "okay", "done"}:
+        return None
+    if title.endswith(("?", "!", ",")):
+        return None
+    if not rest:
+        return None
+    return title, rest
+
+
+def _split_long_paragraph(value: str, *, max_chars: int = 360) -> list[str]:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'`*(])", text)
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if not current:
+            current = sentence
+            continue
+        if len(current) + 1 + len(sentence) <= max_chars:
+            current = f"{current} {sentence}"
+            continue
+        chunks.append(current)
+        current = sentence
+    if current:
+        chunks.append(current)
+
+    expanded: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars + 120:
+            expanded.append(chunk)
+            continue
+        parts = re.split(r"\s+(?:;\s+|→\s+)", chunk)
+        if len(parts) <= 1:
+            expanded.append(chunk)
+            continue
+        buf = ""
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if not buf:
+                buf = part
+            elif len(buf) + 1 + len(part) <= max_chars:
+                buf = f"{buf} {part}"
+            else:
+                expanded.append(buf)
+                buf = part
+        if buf:
+            expanded.append(buf)
+    return expanded or [text]
+
+
+def _rich_paragraph_blocks(value: str) -> list[str]:
+    return [block for block in (_rich_paragraph(chunk) for chunk in _split_long_paragraph(value)) if block]
 
 
 def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) -> str:
@@ -1742,6 +1830,17 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             idx += 1
             continue
 
+        lead_split = _lead_heading_split(line) if (previous_blank or not seen_heading) else None
+        if lead_split:
+            title, rest = lead_split
+            tag = "h3" if not seen_heading else "h4"
+            parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
+            parts.extend(_rich_paragraph_blocks(rest))
+            seen_heading = True
+            previous_blank = False
+            idx += 1
+            continue
+
         if _is_codeish_line(line):
             code_lines = [line.strip()]
             idx += 1
@@ -1772,7 +1871,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 break
             paragraph.append(candidate.strip())
             idx += 1
-        parts.append(_rich_paragraph(" ".join(paragraph)))
+        parts.extend(_rich_paragraph_blocks(" ".join(paragraph)))
         previous_blank = False
     return "\n".join(part for part in parts if part)
 

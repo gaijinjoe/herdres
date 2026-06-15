@@ -1501,6 +1501,30 @@ Verification
         self.assertIn("<h4>Verification</h4>", html)
         self.assertIn("<code>cdee2ca</code> Sync topic names", html)
 
+    def test_turn_renderer_breaks_claude_dense_progress_text_into_readable_blocks(self) -> None:
+        text = (
+            "Diagnosis workflow launched (`wcvm3g3qy`) — 3 parallel readers "
+            "(automated path / manual path / button+storage) -> synthesis -> 2 adversarial verifiers "
+            "(does the manual decision even *have* the failed candidate to persist? will the button actually "
+            "*appear* after the fix?).\n\n"
+            "My working hypothesis from the inline scout: `draft_status_link_reply` calls "
+            "`finish_job(..., \"failed\", ...)` on every failure branch but **never** calls "
+            "`record_failed_draft` / `save_failed_draft_attempts`, so there's nothing for the `faildraft:` "
+            "button to read -> \"no failed draft recorded.\" The automated path *does* persist. "
+            "The verifiers will confirm the two real risks. When it returns I'll design the exact fix."
+        )
+
+        html = herdres.render_final_reply_html(text)
+
+        self.assertIn("<h3>Diagnosis workflow launched", html)
+        self.assertIn("<code>wcvm3g3qy</code>", html)
+        self.assertIn("<i>have</i>", html)
+        self.assertIn("<i>appear</i>", html)
+        self.assertIn("<i>does</i>", html)
+        self.assertIn("<b>never</b>", html)
+        self.assertGreaterEqual(html.count("<p>"), 3)
+        self.assertNotIn("`", html)
+
     def test_oversized_turn_fallback_keeps_more_than_tiny_summary(self) -> None:
         text = "Implemented.\n" + "\n".join(
             f"- Item {idx}: `renamed={idx}` with enough text to inflate rich HTML output."
