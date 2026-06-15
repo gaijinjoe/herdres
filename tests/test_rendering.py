@@ -1344,6 +1344,31 @@ What changed:
         self.assertEqual(text, "clean transcript")
         self.assertEqual(calls, ["recent-unwrapped", "transcript"])
 
+    def test_send_to_agent_pane_submits_newline_after_insert(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run_cmd(args: list[str], *, timeout: int = 8, input_text: str | None = None):
+            calls.append(args)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        with patch.multiple(
+            herdres,
+            pane_by_id=Mock(return_value={"pane_id": "pane-1", "agent": "codex"}),
+            herdr_bin=Mock(return_value="herdr"),
+            run_cmd=fake_run_cmd,
+        ):
+            ok, detail = herdres.send_to_pane("pane-1", "Explain this codebase")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(
+            calls,
+            [
+                ["herdr", "agent", "send", "pane-1", "Explain this codebase"],
+                ["herdr", "pane", "send-text", "pane-1", "\n"],
+            ],
+        )
+
     def test_choices_buttons_include_labels_and_custom_reply(self) -> None:
         markup = herdres.choices_reply_markup(
             "abc123",

@@ -2398,6 +2398,12 @@ def send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, st
         return False, "Herdr pane is not currently live."
     if pane.get("agent"):
         proc = run_cmd([herdr_bin(), "agent", "send", pane_id, text], timeout=timeout)
+        if proc.returncode != 0:
+            return False, sanitize_text(proc.stderr or proc.stdout, 800)
+        submit = run_cmd([herdr_bin(), "pane", "send-text", pane_id, "\n"], timeout=timeout)
+        if submit.returncode != 0:
+            return False, f"Message inserted but submit failed: {sanitize_text(submit.stderr or submit.stdout, 800)}"
+        return True, ""
     else:
         proc = run_cmd([herdr_bin(), "pane", "send-text", pane_id, text], timeout=timeout)
     if proc.returncode != 0:
