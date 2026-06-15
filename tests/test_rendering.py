@@ -1429,6 +1429,43 @@ What changed:
         self.assertEqual(rows[-1][0]["text"], "Custom reply")
         self.assertEqual(rows[-1][0]["callback_data"], "herdr:d:abc123:custom")
 
+    def test_decision_buttons_can_send_explicit_text(self) -> None:
+        item = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": False,
+                "awaiting_input": True,
+                "turn_id": "turn-1",
+                "user_text": "Pick the next step.",
+                "pending_decision": {
+                    "decision_id": "turn-1:decision-1",
+                    "prompt": "How should I proceed?",
+                    "options": [
+                        {"id": "watchdog", "label": "Build watchdog now", "send_text": "1"},
+                        {"id": "timeout", "label": "Patch timeout only", "send_text": "2"},
+                        {"id": "custom", "label": "Write custom instruction", "send_text": ""},
+                    ],
+                },
+            }
+        )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "decision")
+        self.assertEqual(item["decision_id"], "turn-1:decision-1")
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("<b>You asked</b>", html)
+        self.assertIn("<h3>Decision needed</h3>", html)
+        self.assertIn("How should I proceed?", html)
+        markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
+        assert markup is not None and active_prompt is not None
+        rows = markup["inline_keyboard"]
+        self.assertFalse(clear_prompt)
+        self.assertEqual(rows[0][0]["text"], "watchdog. Build watchdog now")
+        self.assertEqual(rows[0][0]["callback_data"], f"herdr:c:{item['prompt_id']}:watchdog")
+        self.assertEqual(rows[2][0]["callback_data"], f"herdr:d:{item['prompt_id']}:custom")
+        self.assertEqual(active_prompt["decision_id"], "turn-1:decision-1")
+
     def test_callback_routes_only_authorized_matching_choice(self) -> None:
         state = callback_state()
         send_to_pane = Mock(return_value=(True, ""))
@@ -1438,6 +1475,43 @@ What changed:
 
         self.assertEqual(result["answer"], "Selected 1.")
         send_to_pane.assert_called_once_with("pane-1", "1")
+
+    def test_callback_routes_decision_send_text(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["active_prompt"] = {
+            "id": "decision1",
+            "options": [
+                {"number": "watchdog", "label": "Build watchdog now", "send_text": "1"},
+                {"number": "timeout", "label": "Patch timeout only", "send_text": "2"},
+            ],
+        }
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:c:decision1:timeout"))
+
+        self.assertEqual(result["answer"], "Selected timeout.")
+        send_to_pane.assert_called_once_with("pane-1", "2")
+
+    def test_callback_custom_decision_option_sets_force_reply(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["active_prompt"] = {
+            "id": "decision1",
+            "options": [
+                {"number": "custom", "id": "custom", "label": "Write custom instruction", "send_text": "", "needs_detail": "1"},
+            ],
+        }
+        send_notice = Mock(return_value={"ok": True})
+        send_to_pane = Mock(return_value=(True, ""))
+
+        with callback_patches(state, send_notice=send_notice, send_to_pane=send_to_pane):
+            result = herdres.callback_reply(callback_payload(user_id="42", data="herdr:d:decision1:custom"))
+
+        self.assertEqual(result["answer"], "Write the instruction in this topic.")
+        self.assertEqual(state["panes"]["pane-1"]["awaiting_detail"]["choice"], "")
+        send_to_pane.assert_not_called()
+        send_notice.assert_called_once()
+        self.assertTrue(send_notice.call_args.kwargs["reply_markup"]["force_reply"])
 
     def test_callback_rejects_non_owner_stale_prompt_and_unknown_choice(self) -> None:
         for payload, expected in (
@@ -1758,6 +1832,68 @@ Verification
         self.assertIn("You asked", entry["last_clean_text"])
         self.assertIn("Likely cause", entry["last_clean_text"])
         self.assertNotIn("Question\nShould not be parsed", entry["last_clean_text"])
+
+    def test_sync_turn_feed_sends_pending_decision_with_buttons(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "blocked",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "awaiting_input": True,
+                "turn_id": "turn-2",
+                "user_text": "Choose an implementation path.",
+                "pending_decision": {
+                    "decision_id": "turn-2:decision-1",
+                    "prompt": "Which path should I take?",
+                    "options": [
+                        {"id": "fast", "label": "Patch minimal path", "send_text": "1"},
+                        {"id": "full", "label": "Build full path", "send_text": "2"},
+                    ],
+                },
+            }
+        )
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1001"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=pane_turn,
+            pane_feed_output=Mock(return_value="Question\nShould not be parsed"),
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        send_feed_item.assert_called_once()
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["kind"], "decision")
+        self.assertEqual(entry["last_clean_kind"], "decision")
+        self.assertEqual(entry["active_prompt"]["decision_id"], "turn-2:decision-1")
+        self.assertEqual(entry["active_prompt"]["options"][1]["send_text"], "2")
+        reply_markup = send_feed_item.call_args.kwargs["reply_markup"]
+        self.assertEqual(reply_markup["inline_keyboard"][1][0]["callback_data"], f"herdr:c:{sent_item['prompt_id']}:full")
+        self.assertIn("Which path should I take?", entry["last_clean_text"])
 
     def test_report_command_turn_feed_uses_pane_turn_not_legacy_parser(self) -> None:
         pane = {

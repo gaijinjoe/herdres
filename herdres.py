@@ -44,7 +44,7 @@ READ_LINES_COMMAND_DEFAULT = 80
 READ_LINES_COMMAND_MAX = 160
 MAX_REPLY_CHARS = 3200
 MAX_STATUS_CHARS = 1500
-MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "6000"))
+MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "14000"))
 MAX_RICH_DETAIL_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_DETAIL_CHARS", "2400"))
 PREFLIGHT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_TTL", "900"))
 PREFLIGHT_GRACE_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_GRACE", "86400"))
@@ -62,10 +62,10 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
     "yes",
     "on",
 }
-RICH_RENDER_VERSION = 12
+RICH_RENDER_VERSION = 13
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
-FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "9000"))
+FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
 FINAL_REPLY_MAX_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES", "140"))
 USER_PROMPT_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS", "1200"))
 DETAIL_REPLY_TIMEOUT_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_DETAIL_TIMEOUT", "1800"))
@@ -969,11 +969,122 @@ def make_feed_item(kind: str, title: str, body: str, *, notify: bool) -> dict[st
     }
 
 
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _callback_id(value: str, fallback: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_-]+", "", str(value or "").strip())
+    return (clean or fallback)[:32]
+
+
+def normalize_pending_decision(turn: dict[str, Any]) -> dict[str, Any] | None:
+    pending = turn.get("pending_decision")
+    if not isinstance(pending, dict):
+        return None
+    raw_options = pending.get("options")
+    if not isinstance(raw_options, list) or not raw_options:
+        return None
+
+    prompt = sanitize_text(str(pending.get("prompt") or ""), 1200).strip()
+    if not prompt:
+        prompt = "Choose how to proceed."
+
+    options: list[dict[str, str]] = []
+    for idx, raw in enumerate(raw_options[:12], start=1):
+        if isinstance(raw, dict):
+            raw_id = str(raw.get("id") or raw.get("number") or idx).strip()
+            label = str(raw.get("label") or raw.get("text") or raw.get("title") or raw_id).strip()
+            if "send_text" in raw:
+                send_text = str(raw.get("send_text") or "").strip()
+            elif "value" in raw:
+                send_text = str(raw.get("value") or "").strip()
+            else:
+                send_text = raw_id
+            needs_detail = (
+                _boolish(raw.get("needs_detail"))
+                or _boolish(raw.get("requires_detail"))
+                or _boolish(raw.get("custom"))
+            )
+        else:
+            raw_id = str(idx)
+            label = str(raw or "").strip()
+            send_text = raw_id
+            needs_detail = False
+
+        raw_id = raw_id or str(idx)
+        label = re.sub(r"^\s*\d{1,2}[.)]\s+", "", label).strip()
+        label = sanitize_text(label or raw_id, 120)
+        callback_id = _callback_id(raw_id, str(idx))
+        if raw_id.lower() == "custom" or callback_id.lower() == "custom":
+            needs_detail = True
+        has_explicit_send_text = isinstance(raw, dict) and "send_text" in raw
+        if has_explicit_send_text:
+            needs_detail = needs_detail or not send_text
+        option: dict[str, str] = {
+            "number": callback_id,
+            "id": sanitize_text(raw_id, 80),
+            "label": label,
+            "send_text": sanitize_text(send_text, 500),
+        }
+        if needs_detail:
+            option["needs_detail"] = "1"
+        options.append(option)
+
+    if not options:
+        return None
+    decision_id = sanitize_text(str(pending.get("decision_id") or turn.get("turn_id") or prompt_id_for(prompt, options)), 300)
+    return {
+        "decision_id": decision_id,
+        "prompt": prompt,
+        "mode": "buttons",
+        "options": options,
+    }
+
+
+def make_decision_feed_item(turn: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any] | None:
+    prompt = sanitize_text(str(decision.get("prompt") or ""), 1200).strip()
+    options = list(decision.get("options") or [])
+    if not prompt or not options:
+        return None
+    user_text = sanitize_text(str(turn.get("user_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    assistant_context = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
+    text_parts: list[str] = []
+    if user_text:
+        text_parts.extend(["You asked", user_text, ""])
+    if assistant_context:
+        text_parts.extend([assistant_context, ""])
+    text_parts.append(prompt)
+    text_parts.append("")
+    text_parts.extend(f"{opt.get('number')}) {opt.get('label')}" for opt in options)
+    return {
+        "kind": "decision",
+        "title": "Decision needed",
+        "summary": prompt,
+        "detail": assistant_context,
+        "lines": prompt.splitlines()[:8],
+        "text": "\n".join(text_parts).strip(),
+        "turn_id": sanitize_text(str(turn.get("turn_id") or ""), 300),
+        "decision_id": str(decision.get("decision_id") or ""),
+        "user_text": user_text,
+        "assistant_final_text": assistant_context,
+        "options": options,
+        "notify": True,
+    }
+
+
 def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(turn, dict):
         return None
     if turn.get("available") is not True:
         return None
+    decision = normalize_pending_decision(turn)
+    if decision and (turn.get("awaiting_input") is True or turn.get("complete") is not True):
+        return make_decision_feed_item(turn, decision)
     if turn.get("complete") is not True:
         return None
     assistant_final = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
@@ -1023,6 +1134,22 @@ def item_plain_text(item: dict[str, Any]) -> str:
             parts.extend(["You asked", user_text, ""])
         if assistant_final:
             parts.append(assistant_final)
+        return sanitize_text("\n".join(parts).strip(), FINAL_REPLY_MAX_CHARS)
+    if str(item.get("kind") or "").lower() == "decision":
+        user_text = str(item.get("user_text") or "").strip()
+        assistant_context = str(item.get("assistant_final_text") or "").strip()
+        prompt = str(item.get("summary") or item.get("text") or "").strip()
+        options = list(item.get("options") or [])
+        parts: list[str] = []
+        if user_text:
+            parts.extend(["You asked", user_text, ""])
+        if assistant_context:
+            parts.extend([assistant_context, ""])
+        if prompt:
+            parts.append(prompt)
+        if options:
+            parts.append("")
+            parts.extend(f"{opt.get('number')}) {opt.get('label')}" for opt in options)
         return sanitize_text("\n".join(parts).strip(), FINAL_REPLY_MAX_CHARS)
     text = str(item.get("text") or "").strip()
     if text:
@@ -1944,10 +2071,43 @@ def render_turn_item_html(item: dict[str, Any]) -> str:
     return rendered
 
 
+def render_decision_item_html(item: dict[str, Any]) -> str:
+    user_text = str(item.get("user_text") or "").strip()
+    assistant_context = str(item.get("assistant_final_text") or "").strip()
+    prompt = str(item.get("summary") or "").strip()
+    options = list(item.get("options") or [])
+    parts: list[str] = []
+    if user_text:
+        parts.append(
+            "<blockquote>"
+            "<b>You asked</b><br>"
+            f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
+            "</blockquote>"
+        )
+    if assistant_context:
+        context_html = render_final_reply_html(assistant_context)
+        if context_html:
+            parts.append(context_html)
+    parts.append("<h3>Decision needed</h3>")
+    if prompt:
+        parts.append(_rich_paragraph(prompt))
+    if options:
+        parts.append(_rich_options_block(options))
+    rendered = "\n".join(part for part in parts if part).strip()
+    if len(rendered) > MAX_RICH_HTML_CHARS:
+        compact = dict(item)
+        compact["assistant_final_text"] = ""
+        compact["summary"] = sanitize_text(prompt, 900)
+        return render_decision_item_html(compact)
+    return rendered
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
     if kind == "turn":
         return render_turn_item_html(item)
+    if kind == "decision":
+        return render_decision_item_html(item)
     title = str(item.get("title") or "").strip()
     if not title:
         title = {
@@ -2159,6 +2319,7 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "lines": item.get("lines") or [],
         "options": item.get("options") or [],
         "turn_id": item.get("turn_id"),
+        "decision_id": item.get("decision_id"),
         "user_text": item.get("user_text"),
         "assistant_final_text": item.get("assistant_final_text"),
     }
@@ -2257,20 +2418,54 @@ def clear_topic_mapping(entry: dict[str, Any], reason: str = "") -> None:
 
 
 def choice_needs_detail(option: dict[str, str]) -> bool:
+    if _boolish(option.get("needs_detail")):
+        return True
     label = str(option.get("label") or "").lower()
     number = str(option.get("number") or "")
-    return number == "4" or any(word in label for word in ("detail", "feedback", "change", "other", "refine"))
+    if number.lower() == "custom" or str(option.get("id") or "").lower() == "custom":
+        return True
+    if "send_text" in option and not str(option.get("send_text") or "").strip():
+        return True
+    return number == "4" or any(word in label for word in ("detail", "feedback", "other", "refine", "custom"))
 
 
 def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[str, Any]:
     rows: list[list[dict[str, str]]] = []
+    has_detail_button = False
     for idx, opt in enumerate(options[:12], start=1):
         number = str(opt.get("number") or idx)
         label = re.sub(r"\s+", " ", str(opt.get("label") or "")).strip()
-        button_text = f"{number}. {label}" if label else number
-        rows.append([{"text": button_text[:64], "callback_data": f"herdr:c:{prompt_id}:{number}"}])
-    rows.append([{"text": "Custom reply", "callback_data": f"herdr:d:{prompt_id}:custom"}])
+        if number.lower() == "custom":
+            button_text = label or "Custom reply"
+        else:
+            button_text = f"{number}. {label}" if label else number
+        action = "d" if choice_needs_detail(opt) else "c"
+        if action == "d":
+            has_detail_button = True
+        rows.append([{"text": button_text[:64], "callback_data": f"herdr:{action}:{prompt_id}:{number}"}])
+    if not has_detail_button:
+        rows.append([{"text": "Custom reply", "callback_data": f"herdr:d:{prompt_id}:custom"}])
     return {"inline_keyboard": rows}
+
+
+def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+    if str(item.get("kind") or "").lower() not in {"choices", "decision"}:
+        return None, None, True
+    options = list(item.get("options") or [])
+    if not options:
+        return None, None, True
+    prompt_id = str(item.get("prompt_id") or prompt_id_for(item_plain_text(item), options))
+    item["prompt_id"] = prompt_id
+    active_prompt = {
+        "id": prompt_id,
+        "text": item_plain_text(item),
+        "item": item,
+        "options": options,
+        "created_at": utc_now(),
+    }
+    if item.get("decision_id"):
+        active_prompt["decision_id"] = str(item.get("decision_id") or "")
+    return choices_reply_markup(prompt_id, options), active_prompt, False
 
 
 def format_status(
@@ -3331,23 +3526,7 @@ def sync_once() -> dict[str, Any]:
                 content_changed = not same_semantic
                 should_deliver = old_clean_has_noise or content_changed or render_changed
                 if sends < MAX_SENDS_PER_RUN and should_deliver and not recent_attempt(entry, item_render_hash):
-                    reply_markup = None
-                    pending_active_prompt = None
-                    clear_active_prompt = False
-                    if item.get("kind") == "choices":
-                        options = list(item.get("options") or [])
-                        prompt_id = str(item.get("prompt_id") or prompt_id_for(item_plain_text(item), options))
-                        item["prompt_id"] = prompt_id
-                        reply_markup = choices_reply_markup(prompt_id, options)
-                        pending_active_prompt = {
-                            "id": prompt_id,
-                            "text": item_plain_text(item),
-                            "item": item,
-                            "options": options,
-                            "created_at": utc_now(),
-                        }
-                    else:
-                        clear_active_prompt = True
+                    reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
                     entry["last_clean_attempt_hash"] = item_render_hash
                     entry["last_clean_attempt_at"] = utc_now()
                     changed = True
@@ -3539,7 +3718,7 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             "reply": (
                 "Pane topic commands:\n"
                 "/report or /status - latest clean report/question\n"
-                "/choices - resend active choices\n"
+                "/choices - resend active choices or decision buttons\n"
                 "/raw [lines] - sanitized raw visible output\n"
                 "/debug - technical mapping details\n"
                 "/send <text> - send instruction to this pane\n"
@@ -3563,20 +3742,26 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             )
             state_changed = before_turn_state != after_turn_state
             if item:
+                reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
                 result = send_feed_item(
                     chat_id,
                     item,
                     telegram=telegram,
                     thread_id=topic_id,
                     notify=False,
+                    reply_markup=reply_markup,
                 )
                 if result.get("ok"):
+                    if pending_active_prompt:
+                        entry["active_prompt"] = pending_active_prompt
+                    elif clear_active_prompt:
+                        entry.pop("active_prompt", None)
                     entry["last_clean_hash"] = clean_feed_hash(item)
                     entry["last_clean_semantic_hash"] = clean_feed_hash(item, include_render_version=False)
                     entry["last_clean_render_hash"] = clean_feed_hash(item)
                     if result.get("message_id"):
                         entry["last_clean_message_id"] = str(result["message_id"])
-                    entry["last_clean_kind"] = "turn"
+                    entry["last_clean_kind"] = str(item.get("kind") or "turn")
                     entry["last_clean_text"] = item_plain_text(item)
                     entry["last_clean_item"] = item
                     entry["last_clean_sent_at"] = utc_now()
@@ -3591,13 +3776,20 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "reply": latest_turn_report(entry, None)}
         item = latest_clean_item(entry, pane)
         if item:
+            reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(item)
             result = send_feed_item(
                 chat_id,
                 item,
                 telegram=telegram,
                 thread_id=topic_id,
                 notify=False,
+                reply_markup=reply_markup,
             )
+            if result.get("ok"):
+                if pending_active_prompt:
+                    entry["active_prompt"] = pending_active_prompt
+                elif clear_active_prompt:
+                    entry.pop("active_prompt", None)
             save_state(state)
             if not result.get("ok"):
                 return {"handled": True, "reply": latest_clean_report(entry, pane)}
@@ -3705,40 +3897,59 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
     if not pane_id or entry.get("last_known_status") == "closed":
         return {"handled": True, "answer": "This pane is no longer live.", "show_alert": True}
 
+    option = next(
+        (
+            opt
+            for opt in options
+            if str(opt.get("number") or "") == choice_number
+            or str(opt.get("callback_id") or "") == choice_number
+            or str(opt.get("id") or "") == choice_number
+        ),
+        None,
+    )
+
     if action == "d":
+        choice_text = ""
+        option_label = "custom"
+        if option:
+            option_label = str(option.get("label") or option.get("id") or choice_number)
+            if str(option.get("id") or "").lower() != "custom" and choice_number.lower() != "custom":
+                choice_text = str(option.get("send_text") if "send_text" in option else option.get("number") or choice_number)
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
-            "choice": "",
-            "option": "custom",
+            "choice": sanitize_text(choice_text, 500).strip(),
+            "option": sanitize_text(option_label, 160),
             "created_at": utc_now(),
         }
         save_state(state)
+        notice_title = "Custom reply" if not choice_text else f"Details for {choice_number}"
+        notice_body = "Write the instruction to send to this pane." if not choice_text else "Write the details to send with this choice."
         send_notice(
             chat_id,
-            "Custom reply",
-            "Write the instruction to send to this pane.",
+            notice_title,
+            notice_body,
             telegram=telegram,
             thread_id=topic_id,
             notify=True,
             reply_markup={
                 "force_reply": True,
                 "selective": True,
-                "input_field_placeholder": "Instruction for this pane",
+                "input_field_placeholder": "Instruction for this pane" if not choice_text else f"Details for {choice_number}",
             },
             reply_to_message_id=message_id,
         )
-        return {"handled": True, "answer": "Write the instruction in this topic."}
+        return {"handled": True, "answer": "Write the instruction in this topic." if not choice_text else "Write the details in this topic."}
 
-    option = next((opt for opt in options if str(opt.get("number")) == choice_number), None)
     if not option:
         return {"handled": True, "answer": "Choice not found."}
 
     if choice_needs_detail(option):
+        choice_text = str(option.get("send_text") if "send_text" in option else choice_number).strip()
         entry["awaiting_detail"] = {
             "user_id": user_id,
             "prompt_id": prompt_id,
-            "choice": choice_number,
+            "choice": sanitize_text(choice_text, 500),
             "option": str(option.get("label") or ""),
             "created_at": utc_now(),
         }
@@ -3759,7 +3970,10 @@ def callback_reply(payload: dict[str, Any]) -> dict[str, Any]:
         )
         return {"handled": True, "answer": "Write the details in this topic."}
 
-    ok, detail = send_to_pane(pane_id, choice_number)
+    outbound = str(option.get("send_text") if "send_text" in option else choice_number).strip()
+    if not outbound:
+        return {"handled": True, "answer": "This choice needs details.", "show_alert": True}
+    ok, detail = send_to_pane(pane_id, outbound)
     if not ok:
         return {"handled": True, "answer": f"Send failed: {detail}", "show_alert": True}
     send_notice(

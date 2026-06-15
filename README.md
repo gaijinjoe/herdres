@@ -12,7 +12,7 @@ It does not patch Hermes or Herdr core files and routine sync uses no LLM calls.
 - Keeps the General topic free for your normal Hermes chat.
 - Sends pane updates with Telegram Bot API 10.1 `sendRichMessage`.
 - Uses `editMessageText(rich_message=...)` for a quiet live status card.
-- Shows clean reports, questions, blockers, and numbered choices.
+- Shows clean reports, questions, blockers, numbered choices, and structured decision buttons.
 - Optionally shows only the last submitted user instruction plus the final assistant reply when `herdr pane turn` is available.
 - Keeps raw transcript and technical metadata behind explicit commands.
 - Routes `/send`, `/keys`, and choice-button replies only to the mapped pane.
@@ -136,6 +136,32 @@ Expected Herdr response:
 
 `user_text` must be a submitted user message, never the visible input composer. `assistant_final_text` must be final assistant output only, without thinking, tool calls, shell output, or TUI chrome.
 
+If a pane is waiting for owner input, Herdr can return a structured decision instead of a completed turn:
+
+```json
+{
+  "available": true,
+  "pane_id": "pane-1",
+  "agent_session_id": "session-1",
+  "turn_id": "turn-2",
+  "complete": false,
+  "awaiting_input": true,
+  "user_text": "Choose an implementation path.",
+  "pending_decision": {
+    "decision_id": "turn-2:decision-1",
+    "prompt": "Which path should I take?",
+    "mode": "buttons",
+    "options": [
+      {"id": "fast", "label": "Patch minimal path", "send_text": "1"},
+      {"id": "full", "label": "Build full path", "send_text": "2"},
+      {"id": "custom", "label": "Write custom instruction", "send_text": ""}
+    ]
+  }
+}
+```
+
+Herdres renders `pending_decision` as a rich decision card with inline buttons in the mapped Telegram topic. Button taps route only to that pane. `send_text` is the exact text sent to Herdr for direct options; an empty `send_text` opens a ForceReply-style custom instruction prompt. Native Telegram polls are intentionally not part of the default owner-control flow.
+
 If Herdr cannot provide structured turn data, it should return:
 
 ```json
@@ -229,10 +255,11 @@ HERDR_TELEGRAM_TOPICS_MAX_SENDS=8
 HERDR_TELEGRAM_TOPICS_FEED_READ_LINES=140
 HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS=9000
 HERDR_TELEGRAM_TOPICS_TURN_FEED=0
-HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS=9000
+HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS=16000
 HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_LINES=140
 HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS=1200
 HERDR_TELEGRAM_TOPICS_RICH_MESSAGES=1
+HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS=14000
 HERDR_TELEGRAM_TOPICS_LIVE_CARD=1
 HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=0
 HERDR_TELEGRAM_TOPICS_DRY_RUN=0
