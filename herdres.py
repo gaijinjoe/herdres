@@ -48,6 +48,8 @@ MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "600
 MAX_RICH_DETAIL_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_DETAIL_CHARS", "2400"))
 PREFLIGHT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_TTL", "900"))
 PREFLIGHT_GRACE_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_GRACE", "86400"))
+TOPIC_VERIFY_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_VERIFY_TTL", "900"))
+MAX_TOPIC_VERIFIES_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_VERIFIES", "3"))
 HERDR_TOPIC_ICON_COLOR = int(os.getenv("HERDR_TELEGRAM_TOPICS_ICON_COLOR", DEFAULT_HERDR_TOPIC_ICON_COLOR))
 HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_EMOJI_ID", "").strip()
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
@@ -1784,6 +1786,32 @@ def clear_clean_feed_state(entry: dict[str, Any]) -> None:
         entry.pop(key, None)
 
 
+def clear_topic_mapping(entry: dict[str, Any], reason: str = "") -> None:
+    """Drop Telegram objects tied to a deleted forum topic, preserving pane identity."""
+    old_topic_id = str(entry.get("topic_id") or "")
+    for key in (
+        "topic_id",
+        "card_message_id",
+        "card_hash",
+        "card_status_hash",
+        "card_format",
+        "last_status_hash",
+        "last_notified_status",
+        "last_sent_at",
+        "last_topic_verified_at",
+        "last_topic_verify_attempt_at",
+        "last_topic_verify_error",
+        "last_topic_verify_error_at",
+    ):
+        entry.pop(key, None)
+    clear_clean_feed_state(entry)
+    entry["topic_missing_at"] = utc_now()
+    if old_topic_id:
+        entry["topic_missing_id"] = old_topic_id
+    if reason:
+        entry["topic_missing_reason"] = sanitize_text(reason, 500)
+
+
 def choice_needs_detail(option: dict[str, str]) -> bool:
     label = str(option.get("label") or "").lower()
     number = str(option.get("number") or "")
@@ -2024,6 +2052,16 @@ def classify_telegram_error(exc: Exception) -> str:
     if isinstance(exc, RateLimited):
         return "rate_limited"
     if (
+        "message thread not found" in text
+        or "message_thread_id_invalid" in text
+        or "message thread invalid" in text
+        or "thread not found" in text
+        or "forum topic not found" in text
+        or "topic not found" in text
+        or "topic_deleted" in text
+    ):
+        return "topic_not_found"
+    if (
         "sendrichmessage" in text
         and ("not found" in text or "does not exist" in text or "no such method" in text or "http 404" in text)
     ):
@@ -2031,6 +2069,8 @@ def classify_telegram_error(exc: Exception) -> str:
     if "method" in text and ("not found" in text or "does not exist" in text):
         return "capability"
     if "message is not modified" in text:
+        return "not_modified"
+    if "topic_not_modified" in text:
         return "not_modified"
     if (
         "message to edit not found" in text
@@ -2043,6 +2083,63 @@ def classify_telegram_error(exc: Exception) -> str:
     if any(fragment in text for fragment in ("timed out", "timeout", "temporarily", "network", "connection", "http 5")):
         return "transient"
     return "transient"
+
+
+def result_topic_missing(result: dict[str, Any] | None) -> bool:
+    return isinstance(result, dict) and (
+        bool(result.get("topic_missing")) or str(result.get("kind") or "") == "topic_not_found"
+    )
+
+
+def topic_verify_due(entry: dict[str, Any], ttl_seconds: int = TOPIC_VERIFY_TTL_SECONDS) -> bool:
+    if not entry.get("topic_id"):
+        return False
+    try:
+        checked = _dt.datetime.fromisoformat(
+            str(entry.get("last_topic_verified_at", "")).replace("Z", "+00:00")
+        )
+    except Exception:
+        try:
+            checked = _dt.datetime.fromisoformat(
+                str(entry.get("last_topic_verify_attempt_at", "")).replace("Z", "+00:00")
+            )
+        except Exception:
+            return True
+    return (_dt.datetime.now(tz=_dt.timezone.utc) - checked).total_seconds() > ttl_seconds
+
+
+def verify_topic_mapping(chat_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    topic_id = str(entry.get("topic_id") or "")
+    if not topic_id:
+        return {"ok": False, "kind": "missing_local_topic"}
+    name = str(entry.get("topic_name") or "Task")
+    try:
+        edit_topic(chat_id, topic_id, name)
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        kind = classify_telegram_error(exc)
+        if kind == "not_modified":
+            entry["last_topic_verified_at"] = utc_now()
+            entry.pop("last_topic_verify_attempt_at", None)
+            entry.pop("last_topic_verify_error", None)
+            entry.pop("last_topic_verify_error_at", None)
+            entry.pop("topic_missing_at", None)
+            entry.pop("topic_missing_id", None)
+            entry.pop("topic_missing_reason", None)
+            return {"ok": True, "kind": kind}
+        if kind == "topic_not_found":
+            return {"ok": False, "kind": kind, "topic_missing": True, "error": str(exc)}
+        entry["last_topic_verify_attempt_at"] = utc_now()
+        return {"ok": False, "kind": kind, "error": str(exc), "transient": kind == "transient"}
+    entry["last_topic_verified_at"] = utc_now()
+    entry.pop("last_topic_verify_attempt_at", None)
+    entry.pop("last_topic_verify_error", None)
+    entry.pop("last_topic_verify_error_at", None)
+    entry.pop("topic_missing_at", None)
+    entry.pop("topic_missing_id", None)
+    entry.pop("topic_missing_reason", None)
+    return {"ok": True}
 
 
 def rich_telegram_state(telegram: dict[str, Any] | None) -> dict[str, Any]:
@@ -2114,6 +2211,34 @@ def send_message(
     return telegram_message_id(telegram_api("sendMessage", payload))
 
 
+def send_legacy_message_result(
+    chat_id: str,
+    text: str,
+    *,
+    thread_id: str | int | None = None,
+    notify: bool = False,
+    reply_markup: dict[str, Any] | None = None,
+    reply_to_message_id: str | int | None = None,
+) -> dict[str, Any]:
+    try:
+        mid = send_message(
+            chat_id,
+            text,
+            thread_id=thread_id,
+            notify=notify,
+            reply_markup=reply_markup,
+            reply_to_message_id=reply_to_message_id,
+        )
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        kind = classify_telegram_error(exc)
+        if kind == "topic_not_found":
+            return {"ok": False, "format": "legacy", "kind": kind, "topic_missing": True, "error": str(exc)}
+        return {"ok": False, "format": "legacy", "kind": kind, "transient": kind == "transient", "error": str(exc)}
+    return {"ok": True, "format": "legacy", "message_id": mid}
+
+
 def edit_message_text(
     chat_id: str,
     message_id: str | int,
@@ -2136,6 +2261,8 @@ def edit_message_text(
         result = {"ok": kind == "not_modified", "kind": kind, "error": str(exc)}
         if kind == "not_found":
             result["not_found"] = True
+        if kind == "topic_not_found":
+            result["topic_missing"] = True
         return result
     return {"ok": True, "kind": "edited", "message_id": telegram_message_id(response)}
 
@@ -2153,7 +2280,7 @@ def send_rich_message(
 ) -> dict[str, Any]:
     fallback = fallback_text or sanitize_text(html.unescape(re.sub(r"<[^>]+>", "", html_text)), MAX_REPLY_CHARS)
     if not rich_enabled(telegram):
-        mid = send_message(
+        return send_legacy_message_result(
             chat_id,
             fallback,
             thread_id=thread_id,
@@ -2161,7 +2288,6 @@ def send_rich_message(
             reply_markup=reply_markup,
             reply_to_message_id=reply_to_message_id,
         )
-        return {"ok": True, "format": "legacy", "message_id": mid}
 
     payload: dict[str, Any] = {
         "chat_id": chat_id,
@@ -2188,7 +2314,7 @@ def send_rich_message(
         kind = classify_telegram_error(exc)
         if kind == "capability":
             mark_rich_disabled(telegram, str(exc))
-            mid = send_message(
+            result = send_legacy_message_result(
                 chat_id,
                 fallback,
                 thread_id=thread_id,
@@ -2196,9 +2322,10 @@ def send_rich_message(
                 reply_markup=reply_markup,
                 reply_to_message_id=reply_to_message_id,
             )
-            return {"ok": True, "format": "legacy", "message_id": mid, "fallback_reason": kind}
+            result["fallback_reason"] = kind
+            return result
         if kind == "bad_request":
-            mid = send_message(
+            result = send_legacy_message_result(
                 chat_id,
                 fallback,
                 thread_id=thread_id,
@@ -2206,7 +2333,10 @@ def send_rich_message(
                 reply_markup=reply_markup,
                 reply_to_message_id=reply_to_message_id,
             )
-            return {"ok": True, "format": "legacy", "message_id": mid, "fallback_reason": kind}
+            result["fallback_reason"] = kind
+            return result
+        if kind == "topic_not_found":
+            return {"ok": False, "format": "rich", "kind": kind, "topic_missing": True, "error": str(exc)}
         return {"ok": False, "format": "rich", "kind": kind, "transient": True, "error": str(exc)}
     mark_rich_supported(telegram)
     return {"ok": True, "format": "rich", "message_id": telegram_message_id(response)}
@@ -2244,6 +2374,8 @@ def edit_rich_message(
             return {"ok": True, "kind": kind}
         if kind == "not_found":
             return {"ok": False, "kind": kind, "not_found": True, "error": str(exc)}
+        if kind == "topic_not_found":
+            return {"ok": False, "kind": kind, "topic_missing": True, "error": str(exc)}
         if kind == "capability":
             mark_rich_disabled(telegram, str(exc))
             legacy = edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup)
@@ -2591,6 +2723,7 @@ def sync_once() -> dict[str, Any]:
             save_state(state)
             raise
     creates = 0
+    verifies = 0
 
     for pane in panes:
         key, entry, new_entry = ensure_pane_entry(state, pane)
@@ -2602,6 +2735,10 @@ def sync_once() -> dict[str, Any]:
             creates += 1
             entry["topic_id"] = topic_id
             entry["topic_name"] = topic_name
+            entry["last_topic_verified_at"] = utc_now()
+            entry.pop("topic_missing_at", None)
+            entry.pop("topic_missing_id", None)
+            entry.pop("topic_missing_reason", None)
             save_state(state)
             changed = True
             if not CLEAN_FEED_ENABLED and sends < MAX_SENDS_PER_RUN:
@@ -2613,6 +2750,22 @@ def sync_once() -> dict[str, Any]:
                 sends += 1
         if not entry.get("topic_id"):
             continue
+        if verifies < MAX_TOPIC_VERIFIES_PER_RUN and topic_verify_due(entry):
+            verify_result = verify_topic_mapping(chat_id, entry)
+            verifies += 1
+            if verify_result.get("ok"):
+                changed = True
+            elif result_topic_missing(verify_result):
+                clear_topic_mapping(entry, str(verify_result.get("error") or verify_result))
+                save_state(state)
+                changed = True
+                continue
+            else:
+                verify_error = sanitize_text(str(verify_result), 500)
+                if entry.get("last_topic_verify_error") != verify_error:
+                    entry["last_topic_verify_error"] = verify_error
+                    entry["last_topic_verify_error_at"] = utc_now()
+                    changed = True
         stable_obj_hash = status_hash(stable_status_object(pane))
         live_item = live_status_item(pane)
         live_card_hash = clean_feed_hash(live_item)
@@ -2622,6 +2775,11 @@ def sync_once() -> dict[str, Any]:
             card_result = update_live_card(chat_id, entry, live_item, telegram=telegram)
             if card_result.get("attempted"):
                 sends += 1
+            if result_topic_missing(card_result):
+                clear_topic_mapping(entry, str(card_result.get("error") or card_result))
+                save_state(state)
+                changed = True
+                continue
             if card_result.get("ok"):
                 entry["card_status_hash"] = live_card_hash
                 changed = True
@@ -2751,6 +2909,11 @@ def sync_once() -> dict[str, Any]:
                         entry["last_clean_sent_at"] = utc_now()
                         entry.pop("last_clean_send_error", None)
                         changed = True
+                    elif result_topic_missing(result):
+                        clear_topic_mapping(entry, str(result.get("error") or result))
+                        save_state(state)
+                        changed = True
+                        continue
                     else:
                         entry["last_clean_send_error"] = sanitize_text(str(result), 500)
                         changed = True
@@ -2761,20 +2924,26 @@ def sync_once() -> dict[str, Any]:
         elif sends < MAX_SENDS_PER_RUN and should_send_status(entry, stable_obj_hash, pane, new_entry):
             pane_status = str(pane.get("agent_status") or "").lower()
             include_recent = pane_status in {"blocked", "unknown"}
-            send_message(
+            status_result = send_legacy_message_result(
                 chat_id,
                 format_status(pane, include_recent=include_recent),
                 thread_id=entry["topic_id"],
                 notify=pane_status in {"blocked", "error"},
             )
-            sends += 1
-            entry["last_status_hash"] = stable_obj_hash
-            entry["last_notified_status"] = pane_status
-            entry["last_sent_at"] = utc_now()
-            changed = True
+            if status_result.get("ok"):
+                sends += 1
+                entry["last_status_hash"] = stable_obj_hash
+                entry["last_notified_status"] = pane_status
+                entry["last_sent_at"] = utc_now()
+                changed = True
+            elif result_topic_missing(status_result):
+                clear_topic_mapping(entry, str(status_result.get("error") or status_result))
+                save_state(state)
+                changed = True
+                continue
 
     save_state(state)
-    return {"ok": True, "changed": changed, "panes": len(panes), "created": creates, "sent": sends}
+    return {"ok": True, "changed": changed, "panes": len(panes), "created": creates, "verified": verifies, "sent": sends}
 
 
 def parse_command(text: str) -> tuple[str, str]:

@@ -1013,6 +1013,188 @@ What changed:
         send_message.assert_not_called()
         pane_turn.assert_called_once_with("pane-1")
 
+    def test_classifies_deleted_forum_topic_as_topic_missing(self) -> None:
+        error = herdres.BridgeError("Telegram sendRichMessage failed: Bad Request: message thread not found")
+
+        self.assertEqual(herdres.classify_telegram_error(error), "topic_not_found")
+        self.assertTrue(herdres.result_topic_missing({"ok": False, "kind": "topic_not_found"}))
+
+    def test_topic_not_modified_counts_as_verified_topic(self) -> None:
+        entry = {"topic_id": "77", "topic_name": "Restored"}
+
+        with patch.object(
+            herdres,
+            "edit_topic",
+            side_effect=herdres.BridgeError("Telegram editForumTopic failed: Bad Request: TOPIC_NOT_MODIFIED"),
+        ):
+            result = herdres.verify_topic_mapping("-1001", entry)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["kind"], "not_modified")
+        self.assertIn("last_topic_verified_at", entry)
+        self.assertNotIn("last_topic_verify_error", entry)
+
+    def test_sync_clears_stale_topic_mapping_when_verification_finds_deleted_topic(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "topic_name": "Restored",
+            "card_message_id": "555",
+            "last_clean_hash": "old-clean",
+            "last_clean_message_id": "999",
+            "active_prompt": {"id": "old"},
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            edit_topic=Mock(
+                side_effect=herdres.BridgeError(
+                    "Telegram editForumTopic failed: Bad Request: message thread not found"
+                )
+            ),
+            send_feed_item=Mock(return_value={"ok": True}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["verified"], 1)
+        self.assertNotIn("topic_id", entry)
+        self.assertEqual(entry["topic_missing_id"], "77")
+        self.assertNotIn("card_message_id", entry)
+        self.assertNotIn("last_clean_hash", entry)
+        self.assertNotIn("active_prompt", entry)
+
+    def test_sync_recreates_topic_after_mapping_was_cleared(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_name": "Restored",
+            "topic_missing_id": "77",
+            "topic_missing_at": "2026-06-15T00:00:00+00:00",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        create_topic = Mock(return_value="88")
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            create_topic=create_topic,
+            pane_turn=Mock(return_value={"available": False, "reason": "no_structured_turn_source"}),
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["created"], 1)
+        create_topic.assert_called_once_with("-1001", "Restored")
+        self.assertEqual(entry["topic_id"], "88")
+        self.assertIn("last_topic_verified_at", entry)
+        self.assertNotIn("topic_missing_id", entry)
+        self.assertNotIn("topic_missing_at", entry)
+
+    def test_sync_clears_topic_mapping_when_clean_send_reports_deleted_topic(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "topic_name": "Restored",
+            "last_topic_verified_at": herdres.utc_now(),
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-1",
+                "user_text": "What happened?",
+                "assistant_final_text": "Final answer only.",
+            }
+        )
+        send_feed_item = Mock(
+            return_value={
+                "ok": False,
+                "kind": "topic_not_found",
+                "topic_missing": True,
+                "error": "Bad Request: message thread not found",
+            }
+        )
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        send_feed_item.assert_called_once()
+        self.assertNotIn("topic_id", entry)
+        self.assertEqual(entry["topic_missing_id"], "77")
+        self.assertNotIn("last_clean_attempt_hash", entry)
+
     def test_live_card_hash_ignores_label_only_changes(self) -> None:
         pane_a = {"agent_status": "working", "label": "Brewed for 1m"}
         pane_b = {"agent_status": "working", "label": "Brewed for 5m"}
