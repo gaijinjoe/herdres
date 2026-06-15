@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Any
 
 DEFAULT_REAL_HERDR = "herdr"
 MAX_TEXT_CHARS = int(os.getenv("HERDRES_TURN_ADAPTER_MAX_TEXT_CHARS", "12000"))
+CLAUDE_FALLBACK_MAX_FILES = int(os.getenv("HERDRES_CLAUDE_FALLBACK_MAX_FILES", "24"))
+CLAUDE_FALLBACK_READ_LINES = int(os.getenv("HERDRES_CLAUDE_FALLBACK_READ_LINES", "160"))
 
 
 def real_herdr_bin() -> str:
@@ -39,6 +42,19 @@ def run_real_herdr_json(args: list[str]) -> dict[str, Any]:
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "").strip() or "real herdr failed")
     return json.loads(proc.stdout)
+
+
+def run_real_herdr_text(args: list[str]) -> str:
+    proc = subprocess.run(
+        [real_herdr_bin(), *args],
+        text=True,
+        capture_output=True,
+        timeout=8,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
 
 
 def sanitize_text(value: str, max_chars: int = MAX_TEXT_CHARS) -> str:
@@ -85,6 +101,18 @@ def is_internal_codex_user_text(text: str) -> bool:
     ))
 
 
+def is_internal_claude_user_text(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith((
+        "<task-notification>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<system-reminder>",
+        "<ide_context>",
+        "<command-name>",
+    ))
+
+
 def codex_session_path(session_id: str) -> Path | None:
     base = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
     sessions = base / "sessions"
@@ -100,6 +128,91 @@ def claude_session_path(session_id: str) -> Path | None:
         return None
     matches = sorted(base.glob(f"**/{session_id}.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0] if matches else None
+
+
+def claude_project_dir_for_cwd(cwd: str) -> Path | None:
+    base = Path(os.getenv("CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude/projects"))).expanduser()
+    if not base.exists() or not cwd:
+        return None
+    encoded = str(Path(cwd)).replace("/", "-")
+    candidate = base / encoded
+    return candidate if candidate.exists() else None
+
+
+def claude_candidate_paths_for_pane(pane: dict[str, Any]) -> list[Path]:
+    cwd = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+    project_dir = claude_project_dir_for_cwd(cwd)
+    if not project_dir:
+        return []
+    paths = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return paths[:CLAUDE_FALLBACK_MAX_FILES]
+
+
+def normalize_for_match(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").lower()).strip()
+
+
+def match_chunks(value: str) -> list[str]:
+    words = normalize_for_match(value).split()
+    chunks: list[str] = []
+    for size in (12, 20, 32):
+        if len(words) >= size:
+            chunks.append(" ".join(words[:size]))
+            chunks.append(" ".join(words[-size:]))
+    if len(words) >= 48:
+        mid = len(words) // 2
+        chunks.append(" ".join(words[max(0, mid - 10):mid + 10]))
+    return [chunk for chunk in chunks if len(chunk) >= 40]
+
+
+def turn_visible_match_score(turn: dict[str, Any], pane_text: str) -> int:
+    visible = normalize_for_match(pane_text)
+    if not visible:
+        return 0
+    score = 0
+    for chunk in match_chunks(str(turn.get("assistant_final_text") or "")):
+        if chunk in visible:
+            score += 1
+    user_text = str(turn.get("user_text") or "")
+    if user_text and not is_internal_claude_user_text(user_text):
+        for chunk in match_chunks(user_text)[:2]:
+            if chunk in visible:
+                score += 1
+    return score
+
+
+def pane_recent_text(pane_id: str) -> str:
+    for source in ("recent-unwrapped", "visible"):
+        text = run_real_herdr_text(
+            ["pane", "read", pane_id, "--source", source, "--lines", str(CLAUDE_FALLBACK_READ_LINES), "--format", "text"]
+        )
+        if text.strip():
+            return text
+    return ""
+
+
+def infer_claude_turn_from_visible_pane(pane: dict[str, Any], pane_id: str) -> dict[str, Any]:
+    pane_text = pane_recent_text(pane_id)
+    if not pane_text.strip():
+        return unavailable("claude_pane_text_unavailable", pane_id=pane_id, agent="claude")
+    matches: list[tuple[int, float, Path, dict[str, Any]]] = []
+    for path in claude_candidate_paths_for_pane(pane):
+        turn = extract_claude_turn(path, pane_id, path.stem)
+        if turn.get("complete") is not True or not turn.get("assistant_final_text"):
+            continue
+        score = turn_visible_match_score(turn, pane_text)
+        if score:
+            matches.append((score, path.stat().st_mtime, path, turn))
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if not matches or matches[0][0] < 2:
+        return unavailable("no_unique_claude_session_match", pane_id=pane_id, agent="claude")
+    if len(matches) > 1 and matches[0][0] < matches[1][0] + 2:
+        return unavailable("ambiguous_claude_session_match", pane_id=pane_id, agent="claude")
+    score, _mtime, path, turn = matches[0]
+    turn["agent_session_id"] = path.stem
+    turn["session_match_source"] = "pane_visible_match"
+    turn["session_match_score"] = score
+    return result_turn(turn)
 
 
 def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, Any]:
@@ -196,13 +309,13 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             if event_type == "user":
                 text = content_text(msg.get("content")).strip()
                 if text:
-                    pending_user_text = sanitize_text(text)
+                    pending_user_text = "" if is_internal_claude_user_text(text) else sanitize_text(text)
                     pending_user_uuid = str(event.get("uuid") or "")
                     incomplete_user = True
                 continue
             if event_type == "assistant":
                 text = content_text(msg.get("content")).strip()
-                if text and msg.get("stop_reason") == "end_turn" and pending_user_text:
+                if text and msg.get("stop_reason") == "end_turn" and pending_user_uuid:
                     latest_complete = {
                         "available": True,
                         "pane_id": pane_id,
@@ -218,6 +331,11 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                     }
                     incomplete_user = False
 
+    if latest_complete:
+        if incomplete_user:
+            latest_complete["has_open_turn"] = True
+            latest_complete["open_turn_id"] = pending_user_uuid
+        return latest_complete
     if incomplete_user:
         return {
             "available": True,
@@ -229,8 +347,6 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             "user_text": pending_user_text,
             "assistant_final_text": "",
         }
-    if latest_complete:
-        return latest_complete
     return {
         "available": True,
         "pane_id": pane_id,
@@ -265,6 +381,8 @@ def pane_turn(pane_id: str) -> dict[str, Any]:
     session = pane.get("agent_session") if isinstance(pane.get("agent_session"), dict) else {}
     session_id = str(session.get("value") or "")
     if not session_id:
+        if agent == "claude":
+            return infer_claude_turn_from_visible_pane(pane, pane_id)
         return unavailable("no_agent_session_id", pane_id=pane_id, agent=agent or None)
 
     if agent == "codex":

@@ -139,11 +139,185 @@ class TurnAdapterTests(unittest.TestCase):
         self.assertEqual(turn["user_text"], "Diagnose it.")
         self.assertEqual(turn["assistant_final_text"], "Final diagnosis.")
 
-    def test_pane_turn_requires_agent_session_id(self) -> None:
+    def test_claude_suppresses_internal_task_notification_user_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "user",
+                        "uuid": "user-1",
+                        "message": {
+                            "role": "user",
+                            "content": "<task-notification><task-id>abc</task-id></task-notification>",
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-1",
+                        "timestamp": "2026-06-15T10:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "stop_reason": "end_turn",
+                            "content": [{"type": "text", "text": "Final diagnosis."}],
+                        },
+                    },
+                ],
+            )
+
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn["user_text"], "")
+        self.assertEqual(turn["assistant_final_text"], "Final diagnosis.")
+
+    def test_claude_returns_latest_complete_when_newer_user_turn_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session-1.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "user",
+                        "uuid": "user-1",
+                        "message": {"role": "user", "content": "What finished?"},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-1",
+                        "timestamp": "2026-06-15T10:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "stop_reason": "end_turn",
+                            "content": [{"type": "text", "text": "The completed result."}],
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "uuid": "user-2",
+                        "message": {"role": "user", "content": "This newer turn is still open."},
+                    },
+                ],
+            )
+
+            turn = adapter.extract_claude_turn(path, "pane-1", "session-1")
+
+        self.assertTrue(turn["available"])
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn["turn_id"], "assistant-1")
+        self.assertEqual(turn["user_text"], "What finished?")
+        self.assertEqual(turn["assistant_final_text"], "The completed result.")
+        self.assertTrue(turn["has_open_turn"])
+        self.assertEqual(turn["open_turn_id"], "user-2")
+
+    def test_claude_no_session_id_can_match_unique_visible_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "-tmp-project"
+            project.mkdir()
+            matched = project / "session-match.jsonl"
+            other = project / "session-other.jsonl"
+            final = (
+                "Yes, done. The updater is working for Codex panes, and Claude panes were skipped "
+                "because Herdr did not expose a session id. The fix is to match a unique visible session."
+            )
+            write_jsonl(
+                matched,
+                [
+                    {"type": "user", "uuid": "u1", "message": {"content": "Check updater."}},
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "timestamp": "now",
+                        "message": {"stop_reason": "end_turn", "content": [{"text": final}]},
+                    },
+                ],
+            )
+            write_jsonl(
+                other,
+                [
+                    {"type": "user", "uuid": "u2", "message": {"content": "Other task."}},
+                    {
+                        "type": "assistant",
+                        "uuid": "a2",
+                        "timestamp": "now",
+                        "message": {"stop_reason": "end_turn", "content": [{"text": "Different final answer."}]},
+                    },
+                ],
+            )
+            pane = {
+                "pane_id": "pane-1",
+                "agent": "claude",
+                "cwd": "/tmp/project",
+                "foreground_cwd": "/tmp/project",
+                "agent_session": None,
+            }
+            with patch.object(adapter, "pane_from_list", Mock(return_value=pane)), patch.dict(
+                adapter.os.environ,
+                {"CLAUDE_PROJECTS_DIR": str(root)},
+            ), patch.object(
+                adapter,
+                "pane_recent_text",
+                Mock(return_value="prefix " + final + " suffix"),
+            ):
+                result = adapter.pane_turn("pane-1")
+
+        turn = result["result"]["turn"]
+        self.assertTrue(turn["available"])
+        self.assertTrue(turn["complete"])
+        self.assertEqual(turn["agent_session_id"], "session-match")
+        self.assertEqual(turn["session_match_source"], "pane_visible_match")
+        self.assertEqual(turn["assistant_final_text"], final)
+
+    def test_claude_visible_session_fallback_fails_closed_when_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "-tmp-project"
+            project.mkdir()
+            final = (
+                "The same visible final answer appears in two candidate sessions, so the adapter "
+                "must not guess which one belongs to the pane."
+            )
+            for name in ("session-a.jsonl", "session-b.jsonl"):
+                write_jsonl(
+                    project / name,
+                    [
+                        {"type": "user", "uuid": "u", "message": {"content": "Check updater."}},
+                        {
+                            "type": "assistant",
+                            "uuid": name,
+                            "timestamp": "now",
+                            "message": {"stop_reason": "end_turn", "content": [{"text": final}]},
+                        },
+                    ],
+                )
+            pane = {
+                "pane_id": "pane-1",
+                "agent": "claude",
+                "cwd": "/tmp/project",
+                "foreground_cwd": "/tmp/project",
+                "agent_session": None,
+            }
+            with patch.object(adapter, "pane_from_list", Mock(return_value=pane)), patch.dict(
+                adapter.os.environ,
+                {"CLAUDE_PROJECTS_DIR": str(root)},
+            ), patch.object(
+                adapter,
+                "pane_recent_text",
+                Mock(return_value=final),
+            ):
+                result = adapter.pane_turn("pane-1")
+
+        turn = result["result"]["turn"]
+        self.assertFalse(turn["available"])
+        self.assertEqual(turn["reason"], "ambiguous_claude_session_match")
+
+    def test_codex_pane_turn_requires_agent_session_id(self) -> None:
         with patch.object(
             adapter,
             "pane_from_list",
-            Mock(return_value={"pane_id": "pane-1", "agent": "claude", "agent_session": None}),
+            Mock(return_value={"pane_id": "pane-1", "agent": "codex", "agent_session": None}),
         ):
             result = adapter.pane_turn("pane-1")
 
