@@ -1395,7 +1395,7 @@ What changed:
         self.assertEqual(detail, "")
         self.assertEqual(calls, [["herdr", "pane", "run", "pane-1", "Explain this codebase"]])
 
-    def test_send_to_working_agent_pane_uses_agent_send_queue(self) -> None:
+    def test_send_to_working_agent_pane_uses_pane_run_to_submit(self) -> None:
         calls: list[list[str]] = []
 
         def fake_run_cmd(args: list[str], *, timeout: int = 8, input_text: str | None = None):
@@ -1412,7 +1412,7 @@ What changed:
 
         self.assertTrue(ok)
         self.assertEqual(detail, "")
-        self.assertEqual(calls, [["herdr", "agent", "send", "pane-1", "rn"]])
+        self.assertEqual(calls, [["herdr", "pane", "run", "pane-1", "rn"]])
 
     def test_choices_buttons_include_labels_and_custom_reply(self) -> None:
         markup = herdres.choices_reply_markup(
