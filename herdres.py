@@ -47,6 +47,7 @@ MAX_STATUS_CHARS = 1500
 MAX_RICH_HTML_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS", "6000"))
 MAX_RICH_DETAIL_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_DETAIL_CHARS", "2400"))
 PREFLIGHT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_TTL", "900"))
+PREFLIGHT_GRACE_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_PREFLIGHT_GRACE", "86400"))
 HERDR_TOPIC_ICON_COLOR = int(os.getenv("HERDR_TELEGRAM_TOPICS_ICON_COLOR", DEFAULT_HERDR_TOPIC_ICON_COLOR))
 HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_EMOJI_ID", "").strip()
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
@@ -2428,6 +2429,51 @@ def preflight_is_fresh(telegram: dict[str, Any]) -> bool:
     return (_dt.datetime.now(tz=_dt.timezone.utc) - checked).total_seconds() < PREFLIGHT_TTL_SECONDS
 
 
+def preflight_ok_within(telegram: dict[str, Any], seconds: int = PREFLIGHT_GRACE_SECONDS) -> bool:
+    try:
+        checked = _dt.datetime.fromisoformat(
+            str(telegram.get("last_preflight_ok_at", "")).replace("Z", "+00:00")
+        )
+    except Exception:
+        return False
+    return (_dt.datetime.now(tz=_dt.timezone.utc) - checked).total_seconds() < seconds
+
+
+def is_transient_telegram_error(error_text: str) -> bool:
+    low = str(error_text or "").lower()
+    markers = (
+        "urlopen error",
+        "timed out",
+        "timeout",
+        "temporary failure",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "network is unreachable",
+        "name or service not known",
+        "unexpected_eof_while_reading",
+        "eof occurred in violation of protocol",
+        "ssl:",
+    )
+    return any(marker in low for marker in markers)
+
+
+def preflight_alert_text(error_text: str) -> str:
+    base = "Herdr topic sync preflight could not verify Telegram access."
+    if is_transient_telegram_error(error_text):
+        return (
+            f"{base}\n"
+            f"Reason: {error_text}\n\n"
+            "This looks like a transient Telegram network/TLS failure, not a bot permission problem. "
+            "Sync will continue if a recent permission check succeeded."
+        )
+    return (
+        "Herdr topic sync is blocked before topic creation.\n"
+        f"Reason: {error_text}\n\n"
+        "Grant the bot admin permission to manage topics in the Telegram forum group, then run the sync again."
+    )
+
+
 def ensure_pane_entry(state: dict[str, Any], pane: dict[str, Any]) -> tuple[str, dict[str, Any], bool]:
     key = pane_key(pane)
     panes = state.setdefault("panes", {})
@@ -2516,31 +2562,34 @@ def sync_once() -> dict[str, Any]:
         telegram.pop("last_preflight_error", None)
     except BridgeError as exc:
         error_text = sanitize_text(str(exc), 500)
-        should_alert = telegram.get("last_preflight_error") != error_text
-        if not should_alert:
-            try:
-                last_alert = _dt.datetime.fromisoformat(
-                    str(telegram.get("last_preflight_alert_at", "")).replace("Z", "+00:00")
-                )
-                should_alert = (_dt.datetime.now(tz=_dt.timezone.utc) - last_alert).total_seconds() > 3600
-            except Exception:
-                should_alert = True
-        if should_alert and chat_id:
-            try:
-                send_message(
-                    chat_id,
-                    "Herdr topic sync is blocked before topic creation.\n"
-                    f"Reason: {error_text}\n\n"
-                    "Grant the bot admin permission to manage topics in the Telegram forum group, then run the sync again.",
-                    thread_id=telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID),
-                    notify=True,
-                )
-                telegram["last_preflight_alert_at"] = utc_now()
-            except Exception:
-                pass
-        telegram["last_preflight_error"] = error_text
-        save_state(state)
-        raise
+        if is_transient_telegram_error(error_text) and preflight_ok_within(telegram):
+            telegram["last_preflight_warning"] = error_text
+            telegram["last_preflight_warning_at"] = utc_now()
+            save_state(state)
+        else:
+            should_alert = telegram.get("last_preflight_error") != error_text
+            if not should_alert:
+                try:
+                    last_alert = _dt.datetime.fromisoformat(
+                        str(telegram.get("last_preflight_alert_at", "")).replace("Z", "+00:00")
+                    )
+                    should_alert = (_dt.datetime.now(tz=_dt.timezone.utc) - last_alert).total_seconds() > 3600
+                except Exception:
+                    should_alert = True
+            if should_alert and chat_id:
+                try:
+                    send_message(
+                        chat_id,
+                        preflight_alert_text(error_text),
+                        thread_id=telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID),
+                        notify=not is_transient_telegram_error(error_text),
+                    )
+                    telegram["last_preflight_alert_at"] = utc_now()
+                except Exception:
+                    pass
+            telegram["last_preflight_error"] = error_text
+            save_state(state)
+            raise
     creates = 0
 
     for pane in panes:

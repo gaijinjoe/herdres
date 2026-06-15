@@ -951,6 +951,68 @@ What changed:
         self.assertNotIn("suppress_auto_feed_until_bounded_report", entry)
         send_feed_item.assert_called_once()
 
+    def test_transient_preflight_alert_does_not_blame_permissions(self) -> None:
+        error = "Telegram getChat failed: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred>"
+
+        text = herdres.preflight_alert_text(error)
+
+        self.assertIn("network/TLS failure", text)
+        self.assertNotIn("Grant the bot admin permission", text)
+        self.assertTrue(herdres.is_transient_telegram_error(error))
+
+    def test_sync_continues_on_transient_preflight_with_recent_success(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {
+                "chat_id": "-1001",
+                "general_thread_id": "1",
+                "owner_user_ids": ["42"],
+                "last_preflight_ok_at": (
+                    herdres._dt.datetime.now(tz=herdres._dt.timezone.utc)
+                    - herdres._dt.timedelta(seconds=herdres.PREFLIGHT_TTL_SECONDS + 30)
+                ).isoformat(),
+            },
+            "panes": {key: entry},
+        }
+        send_message = Mock(return_value={"ok": True})
+        pane_turn = Mock(return_value={"available": False, "reason": "no_structured_turn_source"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight=Mock(
+                side_effect=herdres.BridgeError(
+                    "Telegram getChat failed: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred>"
+                )
+            ),
+            send_message=send_message,
+            pane_turn=pane_turn,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sent"], 0)
+        self.assertIn("last_preflight_warning", state["telegram"])
+        self.assertNotIn("last_preflight_error", state["telegram"])
+        send_message.assert_not_called()
+        pane_turn.assert_called_once_with("pane-1")
+
     def test_live_card_hash_ignores_label_only_changes(self) -> None:
         pane_a = {"agent_status": "working", "label": "Brewed for 1m"}
         pane_b = {"agent_status": "working", "label": "Brewed for 5m"}
