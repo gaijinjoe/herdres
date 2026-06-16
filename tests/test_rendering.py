@@ -2223,6 +2223,239 @@ Codex thinks your real objection is register, not raw word count. Which is it?
         self.assertIsNone(active_prompt)
         self.assertTrue(clear_prompt)
 
+    def test_visible_readonly_choice_fallback_accepts_which_should_prompt(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "blocked"}
+        raw = """☐ Runner default
+
+Now that the trade-off is clear (pool = faster per draft + clean
+context but more idle RAM; claude -p = slower per draft but ~zero
+idle RAM, simpler), which runner topology should the toggle
+default to? All keep Codex as the real cross-provider backup.
+
+❯ 1. Pool primary + Codex backup (Recommended)
+     Keep claude-pool as primary.
+  2. claude -p primary + Codex backup
+     Flip the toggle default to print.
+  3. claude -p → pool → Codex chain
+     Try claude -p first, fall back to claude-pool, then Codex.
+  4. Type something.
+──────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+        with patch.object(herdres, "pane_output", Mock(return_value=raw)):
+            item = herdres.extract_visible_readonly_feed_item(pane)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "choices")
+        self.assertEqual(item["choice_source"], "visible_readonly")
+        self.assertEqual(len(item["options"]), 5)
+        self.assertIn("which runner topology should the toggle", item["summary"])
+
+    def test_visible_readonly_choice_fallback_accepts_which_do_you_want_prompt(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "blocked"}
+        raw = """What I'd actually recommend
+
+The clean toggle we just got Codex-approved supports either as
+the default with a one-line flip — no architecture change. So
+the real question is just which default, and I'd not build a
+claude-p→pool fallback chain. Three options:
+──────────────────────────────────────────────────────────────────
+ ☐ Runner default
+
+Given claude-pool is faster (warm) and claude -p is slower
+(cold-start), and a pool-as-backup-for-claude-p adds little (same
+account/CLI), which runner topology do you want? (All three keep
+Codex as the real cross-provider backup.)
+
+❯ 1. Pool primary + Codex backup (fastest) — Recommended
+     Keep claude-pool as primary (the performant choice, ~2x
+     faster per call), Codex as the fallback on Claude failures.
+     This is the current approved plan (default OFF=pool). claude
+     -p stays a clean toggle you can flip anytime.
+  2. claude -p primary + Codex backup
+     Flip the toggle's default to print (claude -p). Slower per
+     call (~4s cold) but simpler/more predictable than the
+     pool/TUI. NOT a performance win — choose this only if you
+     value claude -p's simplicity/reliability. Codex still backs
+     up Claude failures.
+  3. claude -p primary → pool → Codex chain
+     The literal ask: try claude -p, then claude-pool, then Codex.
+     I advise against it: pool can't cover claude -p's quota/auth
+     failures (same account), so the extra tier adds complexity
+     for little resilience, and primary claude -p is slower.
+  4. Type something.
+──────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+        with patch.object(herdres, "pane_output", Mock(return_value=raw)):
+            item = herdres.extract_visible_readonly_feed_item(pane)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "choices")
+        self.assertEqual(item["title"], "Input needed")
+        self.assertEqual(item["choice_source"], "visible_readonly")
+        self.assertNotIn("decision_id", item)
+        self.assertEqual(len(item["options"]), 5)
+        self.assertIn("which runner topology do you want", item["summary"])
+        self.assertIn("Three options", item["detail"])
+        self.assertIn("performant choice", item["options"][0]["description"])
+        self.assertIn("Visible-screen prompt only", item["detail"])
+
+        markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
+        self.assertIsNone(markup)
+        self.assertIsNone(active_prompt)
+        self.assertTrue(clear_prompt)
+
+    def test_visible_readonly_choice_fallback_accepts_wrapped_which_do_you_want_prompt(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "blocked"}
+        raw = """Given claude-pool is faster (warm) and claude -p is slower
+(cold-start), and a pool-as-backup-for-claude-p adds little,
+which runner topology do you
+want? (All three keep Codex as the real cross-provider backup.)
+
+❯ 1. Pool primary + Codex backup (fastest) — Recommended
+     Keep claude-pool as primary.
+  2. claude -p primary + Codex backup
+     Flip the toggle's default to print.
+"""
+
+        with patch.object(herdres, "pane_output", Mock(return_value=raw)):
+            item = herdres.extract_visible_readonly_feed_item(pane)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "choices")
+        self.assertEqual(item["choice_source"], "visible_readonly")
+        self.assertEqual(len(item["options"]), 2)
+        self.assertIn("which runner topology do you\nwant?", item["summary"])
+
+    def test_wrapped_which_do_you_want_hint_stops_at_sentence_boundary(self) -> None:
+        raw = """Blocked
+Which file changed. Do you want the full diff? Files touched:
+1. loader.py
+2. parser.py
+3. utils.py
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "blocked"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "blocked")
+
+    def test_wrapped_which_should_hint_stops_at_sentence_boundary(self) -> None:
+        raw = """Blocked
+Which file changed. Should the report include the full diff? Files touched:
+1. loader.py
+2. parser.py
+3. utils.py
+"""
+
+        item = herdres.extract_clean_feed_item({"agent_status": "blocked"}, {}, raw)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "blocked")
+
+    def test_make_turn_feed_item_ignores_completed_turn_when_open_turn_exists_without_decision(self) -> None:
+        item = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": True,
+                "has_open_turn": True,
+                "turn_id": "old-turn",
+                "assistant_final_text": "Old completed final answer.",
+            }
+        )
+
+        self.assertIsNone(item)
+
+    def test_make_turn_feed_item_delivers_completed_turn_when_no_open_turn_exists(self) -> None:
+        item = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": True,
+                "turn_id": "current-turn",
+                "assistant_final_text": "Current completed final answer.",
+            }
+        )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "turn")
+        self.assertEqual(item["turn_id"], "current-turn")
+        self.assertIn("Current completed final answer", item["assistant_final_text"])
+
+    def test_make_turn_feed_item_allows_structured_decision_when_open_turn_exists(self) -> None:
+        item = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": True,
+                "has_open_turn": True,
+                "awaiting_input": True,
+                "turn_id": "turn-with-decision",
+                "assistant_final_text": "Context for the decision.",
+                "pending_decision": {
+                    "decision_id": "decision-1",
+                    "prompt": "How should I proceed?",
+                    "options": [
+                        {"id": "1", "label": "Continue", "send_text": "1"},
+                        {"id": "2", "label": "Stop", "send_text": "2"},
+                    ],
+                },
+            }
+        )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "decision")
+        self.assertEqual(item["decision_id"], "decision-1")
+
+    def test_open_completed_turn_falls_back_to_visible_readonly_prompt(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "blocked"}
+        turn = {
+            "available": True,
+            "complete": True,
+            "has_open_turn": True,
+            "open_turn_id": "open-user-turn",
+            "turn_id": "old-complete-turn",
+            "assistant_final_text": "Old completed final answer.",
+        }
+        raw = """☐ Runner default
+
+Now that the trade-off is clear, which runner topology should the
+toggle default to?
+
+❯ 1. Pool primary + Codex backup (Recommended)
+     Keep claude-pool as primary.
+  2. claude -p primary + Codex backup
+     Flip the toggle default to print.
+"""
+
+        with (
+            patch.object(herdres, "pane_turn", Mock(return_value=turn)),
+            patch.object(herdres, "pane_output", Mock(return_value=raw)),
+        ):
+            item = herdres.extract_turn_feed_item(pane, {})
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "choices")
+        self.assertEqual(item["choice_source"], "visible_readonly")
+        self.assertEqual(item["turn_id"][:17], "visible-readonly:")
+        markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
+        self.assertIsNone(markup)
+        self.assertIsNone(active_prompt)
+        self.assertTrue(clear_prompt)
+
     def test_visible_readonly_free_text_question_surfaces_without_buttons(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
         raw = """I found two possible fixes.
@@ -2524,6 +2757,39 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         item = herdres.make_turn_feed_item(turn)
 
+        self.assertEqual(item["kind"], "interaction_readonly")
+        self.assertEqual(item["interaction_id"], "turn-1:interaction")
+
+    def test_pending_decision_rejects_when_pending_interaction_present(self) -> None:
+        turn = {
+            "available": True,
+            "complete": False,
+            "awaiting_input": True,
+            "turn_id": "turn-1",
+            "pending_interaction": {
+                "interaction_id": "turn-1:interaction",
+                "kind": "multi_question_form",
+                "revision": 1,
+                "questions": [
+                    {
+                        "question_id": "q1",
+                        "title": "First question",
+                        "options": [{"option_id": "1", "label": "One", "value": "1"}],
+                    }
+                ],
+            },
+            "pending_decision": {
+                "decision_id": "turn-1:decision",
+                "prompt": "This flat decision must not be used.",
+                "options": [{"id": "1", "label": "Unsafe flat option", "send_text": "1"}],
+            },
+        }
+
+        self.assertIsNone(herdres.normalize_pending_decision(turn))
+        item = herdres.make_turn_feed_item(turn)
+
+        self.assertIsNotNone(item)
+        assert item is not None
         self.assertEqual(item["kind"], "interaction_readonly")
         self.assertEqual(item["interaction_id"], "turn-1:interaction")
 
@@ -3896,6 +4162,56 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertEqual(entry["last_clean_kind"], "choices")
         self.assertNotIn("active_prompt", entry)
 
+    def test_sync_turn_feed_does_not_fall_back_to_visible_choice_prompt_by_default(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        raw = """Codex thinks your real objection is register, not raw word count. Which is it?
+
+❯ 1. Mostly register/tone
+     A short explainer is still bad.
+  2. Mostly length
+     You want shorter by default.
+"""
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1002"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_unique_claude_session_match"}),
+            pane_output=Mock(return_value=raw),
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+            VISIBLE_READONLY_PROMPTS_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertEqual(result["feed_sent"], 1)
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["kind"], "choices")
+        self.assertEqual(sent_item["choice_source"], "visible_readonly")
+        self.assertIsNone(send_feed_item.call_args.kwargs["reply_markup"])
+        self.assertNotIn("active_prompt", entry)
+
         send_feed_item.reset_mock()
         with patch.multiple(
             herdres,
@@ -4304,6 +4620,56 @@ Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll r
         self.assertEqual(sent_item["kind"], "choices")
         self.assertEqual(sent_item["choice_source"], "visible_scrape")
         self.assertEqual(entry["last_clean_kind"], "choices")
+        self.assertEqual(entry["active_prompt"]["choice_source"], "visible_scrape")
+
+    def test_sync_turn_feed_falls_back_to_visible_choice_prompt(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        raw = """Codex thinks your real objection is register, not raw word count. Which is it?
+
+❯ 1. Mostly register/tone
+     A short explainer is still bad.
+  2. Mostly length
+     You want shorter by default.
+"""
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1002"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_unique_claude_session_match"}),
+            pane_output=Mock(return_value=raw),
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=True,
+            VISIBLE_READONLY_PROMPTS_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertEqual(result["feed_sent"], 1)
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["kind"], "choices")
+        self.assertEqual(sent_item["choice_source"], "visible_scrape")
+        self.assertIsNotNone(send_feed_item.call_args.kwargs["reply_markup"])
         self.assertEqual(entry["active_prompt"]["choice_source"], "visible_scrape")
 
     def test_report_command_turn_feed_uses_pane_turn_not_legacy_parser(self) -> None:

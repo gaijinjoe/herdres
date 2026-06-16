@@ -63,6 +63,7 @@ STATUS_MARKER_SUPPRESS_WHEN_ICON_OK = os.getenv(
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
+RICH_BAD_REQUEST_LIMIT = int(os.getenv("HERDR_TELEGRAM_TOPICS_RICH_BAD_REQUEST_LIMIT", "3"))
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
 STATUS_MARKER_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "1").lower() in {"1", "true", "yes", "on"}
 VISIBLE_CHOICE_BUTTONS_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_BUTTONS", "0").lower() in {
@@ -182,7 +183,7 @@ RESUME_CONTROL_RE = re.compile(
 STRUCTURED_SECTION_RE = re.compile(r"^\s*([A-Za-z][A-Za-z ]{0,40})\s*:\s*(.*?)\s*$")
 INLINE_CODE_RE = re.compile(r"`([^`\n]{1,300})`")
 COMMIT_LINE_RE = re.compile(r"^`?([0-9a-f]{7,12})\s+(.+?)`?$", re.IGNORECASE)
-FENCE_START_RE = re.compile(r"^\s*```\s*([A-Za-z0-9_+-]{0,32})\s*$")
+FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
 TOKEN_CODE_RE = re.compile(
     r"(?<![\w/])("
     r"(?:~|/)[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+(?::\d+)?|"
@@ -193,6 +194,16 @@ TOKEN_CODE_RE = re.compile(
     r"\b[0-9a-f]{7,12}\b"
     r")(?![\w/])"
 )
+# Markdown link / image / bare-URL / math spans, masked before inline-code detection
+# so a URL query string or an equation is never shattered into a <code> box.
+MD_IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(\s*(https?://[^)\s]+|/[^)\s]+)\s*\)")
+MD_LINK_RE = re.compile(r"\[([^\]\n]{1,400})\]\(\s*(https?://[^)\s]+|mailto:[^)\s]+)\s*\)")
+BARE_URL_RE = re.compile(r"(?i)(?<![\"'>=/\w])(?:https?://|www\.)[^\s<>()\[\]]+[^\s<>()\[\].,;:!?'\"]")
+MATH_SPAN_RE = re.compile(r"\\\([^\n]{1,400}?\\\)|\\\[[^\n]{1,400}?\\\]|\$\$[^\n]{1,400}?\$\$")
+HRULE_RE = re.compile(r"^\s*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+_PH_OPEN = chr(0xE000)
+_PH_CLOSE = chr(0xE001)
+_PH_RE = re.compile(_PH_OPEN + r"(\d+)" + _PH_CLOSE)
 SECTION_ALIASES = {
     "summary": "summary",
     "short summary": "summary",
@@ -345,7 +356,8 @@ def sanitize_text(text: str, max_chars: int = MAX_REPLY_CHARS) -> str:
             out = pat.sub(lambda m: f"{m.group(1)}=***", out)
         else:
             out = pat.sub("***", out)
-    out = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", out)
+    out = ANSI_RE.sub("", out)
+    out = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", out)
     if len(out) > max_chars:
         out = out[: max_chars - 80].rstrip() + "\n...[truncated by herdr-topic bridge]"
     return out
@@ -1410,6 +1422,8 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     decision = normalize_pending_decision(turn) if STRUCTURED_INTERACTIONS_ENABLED else None
     if decision and (turn.get("awaiting_input") is True or turn.get("complete") is not True):
         return make_decision_feed_item(turn, decision)
+    if turn.get("has_open_turn") is True:
+        return None
     if turn.get("complete") is not True:
         return None
     assistant_final = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
@@ -1674,12 +1688,18 @@ def _is_codeish_line(line: str) -> bool:
     stripped = str(line or "").strip()
     if not stripped or is_trivial_marker_line(stripped):
         return False
-    return (
-        raw.startswith(("    ", "\t"))
-        or stripped.startswith(("$ ", "# ", "./"))
-        or bool(re.match(r"^(cd|python3?|pip3?|npm|pnpm|yarn|node|git|gh|curl|ssh|systemctl|journalctl|herdr)\b", stripped))
-        or bool(re.match(r"^[A-Z][A-Z0-9_]+=", stripped))
-    )
+    if re.match(r"^#{1,6}\s+\S", stripped):
+        # Markdown ATX heading (e.g. "# Title"), not a shell comment.
+        return False
+    if raw.startswith(("    ", "\t")) or stripped.startswith(("$ ", "./")):
+        return True
+    if re.match(r"^(cd|python3?|pip3?|npm|pnpm|yarn|node|git|gh|curl|ssh|systemctl|journalctl|herdr)\b", stripped):
+        # Treat as a command only when it looks command-shaped (short, or has a
+        # flag/path/operator) so prose like "git handles version control" stays prose.
+        return len(stripped.split()) <= 3 or bool(re.search(r"(?:^|\s)[-/]|--|[=|<>]", stripped))
+    if re.fullmatch(r"[A-Z][A-Z0-9_]+=\S+", stripped):
+        return True
+    return False
 
 
 def looks_like_path_or_symbol(value: str) -> bool:
@@ -1699,8 +1719,18 @@ def looks_like_path_or_symbol(value: str) -> bool:
     return False
 
 
-def _rich_text_segment(value: str) -> str:
-    text = str(value or "")
+def _apply_emphasis(rendered: str) -> str:
+    rendered = re.sub(r"\*\*\*([^\n]+?)\*\*\*", r"<b><i>\1</i></b>", rendered)
+    rendered = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", rendered)
+    rendered = re.sub(r"___([^\n]+?)___", r"<b><i>\1</i></b>", rendered)
+    rendered = re.sub(r"__([^\n]+?)__", r"<b>\1</b>", rendered)
+    rendered = re.sub(r"(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])", r"<i>\1</i>", rendered)
+    rendered = re.sub(r"~~([^\s~][^\n]*?)~~", r"<s>\1</s>", rendered)
+    return rendered
+
+
+def _rich_code_and_escape(text: str) -> str:
     parts: list[str] = []
     pos = 0
     for match in TOKEN_CODE_RE.finditer(text):
@@ -1708,9 +1738,39 @@ def _rich_text_segment(value: str) -> str:
         parts.append(f"<code>{html.escape(match.group(1), quote=False)}</code>")
         pos = match.end()
     parts.append(html.escape(text[pos:], quote=False).replace("`", ""))
-    rendered = "".join(parts)
-    rendered = re.sub(r"\*\*([^*\n]{1,300})\*\*", r"<b>\1</b>", rendered)
-    rendered = re.sub(r"(?<!\*)\*([^*\n]{1,180})\*(?!\*)", r"<i>\1</i>", rendered)
+    return "".join(parts)
+
+
+def _rich_text_segment(value: str) -> str:
+    text = str(value or "")
+    stash: list[str] = []
+
+    def _keep(fragment: str) -> str:
+        stash.append(fragment)
+        return f"{_PH_OPEN}{len(stash) - 1}{_PH_CLOSE}"
+
+    def _image(match: "re.Match[str]") -> str:
+        url = match.group(2).strip()
+        label = match.group(1).strip() or url
+        return _keep(f'<a href="{html.escape(url, quote=True)}">{html.escape(label, quote=False)}</a>')
+
+    def _link(match: "re.Match[str]") -> str:
+        label = _apply_emphasis(_rich_code_and_escape(match.group(1)))
+        url = match.group(2).strip()
+        return _keep(f'<a href="{html.escape(url, quote=True)}">{label}</a>')
+
+    def _bare(match: "re.Match[str]") -> str:
+        url = match.group(0)
+        return _keep(f'<a href="{html.escape(url, quote=True)}">{html.escape(url, quote=False)}</a>')
+
+    text = MD_IMAGE_RE.sub(_image, text)
+    text = MD_LINK_RE.sub(_link, text)
+    text = MATH_SPAN_RE.sub(lambda m: _keep(html.escape(m.group(0), quote=False)), text)
+    text = BARE_URL_RE.sub(_bare, text)
+
+    rendered = _apply_emphasis(_rich_code_and_escape(text))
+    if stash:
+        rendered = _PH_RE.sub(lambda m: stash[int(m.group(1))], rendered)
     return rendered
 
 
@@ -1718,7 +1778,7 @@ def _rich_inline(value: str, max_chars: int = 500) -> str:
     clean = str(value or "").strip()
     if not clean:
         return ""
-    if "`" not in clean and (_is_codeish_line(clean) or looks_like_path_or_symbol(clean)):
+    if "`" not in clean and len(clean) <= 80 and (looks_like_path_or_symbol(clean) or _is_codeish_line(clean)):
         return f"<code>{_html_text(clean, max_chars)}</code>"
     clean = sanitize_text(clean, max_chars)
     parts: list[str] = []
@@ -1925,9 +1985,28 @@ def _table_cells(line: str) -> list[str]:
         return []
     if text.startswith("|"):
         text = text[1:]
-    if text.endswith("|"):
+    if text.endswith("|") and not text.endswith("\\|"):
         text = text[:-1]
-    cells = [cell.strip() for cell in text.split("|")]
+    cells: list[str] = []
+    buf: list[str] = []
+    in_code = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] == "|":
+            buf.append("|")
+            i += 2
+            continue
+        if ch == "`":
+            in_code = not in_code
+            buf.append(ch)
+        elif ch == "|" and not in_code:
+            cells.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    cells.append("".join(buf).strip())
     return cells if len(cells) >= 2 and any(cells) else []
 
 
@@ -2172,9 +2251,12 @@ TURN_INLINE_SECTION_RE = re.compile(
 def _plain_heading_title(value: str) -> str:
     clean = str(value or "").strip()
     clean = re.sub(r"`([^`\n]{1,300})`", r"\1", clean)
-    clean = re.sub(r"\*\*([^*\n]{1,300})\*\*", r"\1", clean)
+    clean = re.sub(r"\*\*\*([^\n]+?)\*\*\*", r"\1", clean)
+    clean = re.sub(r"\*\*([^\n]+?)\*\*", r"\1", clean)
     clean = re.sub(r"(?<!\*)\*([^*\n]{1,180})\*(?!\*)", r"\1", clean)
-    clean = clean.strip(" -*_`")
+    clean = re.sub(r"__([^\n]+?)__", r"\1", clean)
+    clean = re.sub(r"~~([^\n]+?)~~", r"\1", clean)
+    clean = clean.strip(" -*_`~")
     return re.sub(r"\s+", " ", clean).strip()
 
 
@@ -2205,8 +2287,13 @@ def _is_turn_heading_line(
     clean = str(line or "").strip()
     if not clean or len(clean) > 120:
         return False
+    if HRULE_RE.match(clean):
+        return False
     if FENCE_START_RE.match(clean) or _bullet_text(clean) or _numbered_text(clean) or _checklist_item(clean):
         return False
+    if re.match(r"^#{1,6}\s+\S", clean):
+        # Explicit Markdown heading: always a heading, regardless of length/inline code.
+        return True
     if clean.startswith(">") or _is_table_line(clean) or _is_codeish_line(clean):
         return False
     words = _turn_heading_title(clean).split()
@@ -2217,11 +2304,9 @@ def _is_turn_heading_line(
     key = _turn_heading_title(clean).lower()
     if key in TURN_KNOWN_HEADING_KEYS:
         return True
-    if clean.startswith("#"):
-        return True
     if clean.endswith(":"):
         return True
-    if first_block and len(words) <= 4 and not clean.endswith(("!", "?")):
+    if first_block and next_nonempty and len(words) <= 4 and not clean.endswith(("!", "?")):
         return True
     if previous_blank and next_nonempty and len(words) <= 4 and not clean.endswith(("!", "?")):
         return True
@@ -2339,12 +2424,19 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             idx += 1
             continue
 
+        if HRULE_RE.match(line.strip()):
+            # Thematic break: render as vertical spacing, never a "---" heading.
+            previous_blank = True
+            idx += 1
+            continue
+
         fence = FENCE_START_RE.match(line)
         if fence:
-            language = fence.group(1).strip()
+            marker = fence.group(1)[0]
+            language = fence.group(2).strip()
             code_lines: list[str] = []
             idx += 1
-            while idx < len(lines) and not str(lines[idx]).strip().startswith("```"):
+            while idx < len(lines) and not str(lines[idx]).strip().startswith(marker * 3):
                 code_lines.append(str(lines[idx]).rstrip())
                 idx += 1
             if idx < len(lines):
@@ -2762,6 +2854,29 @@ def contains_marker(text: str, markers: tuple[str, ...]) -> bool:
     return False
 
 
+CHOICE_CONTEXT_RE = re.compile(
+    r"\b(choose|select|pick|approve)\b"
+    r"|\bwhich\s+[^?.!\n]{0,100}?\bdo\s+you\s+want\?"
+    r"|\bwhich\s+[^?.!\n]{0,120}?\bshould\b[^?.!\n]{0,120}?\?"
+    r"|\bwhich\s+(?:is\s+it|one|path|option)\b",
+    re.IGNORECASE,
+)
+WRAPPED_CHOICE_CONTEXT_RE = re.compile(
+    r"\bwhich\s+[^?.!]{0,100}?\bdo\s+you\s+want\?"
+    r"|\bwhich\s+[^?.!]{0,120}?\bshould\b[^?.!]{0,120}?\?"
+    r"|\bwhich\s+(?:is\s+it|one|path|option)\b",
+    re.IGNORECASE,
+)
+
+
+def has_choice_context_hint(text: str) -> bool:
+    raw = str(text or "")
+    for line in raw.splitlines() or [raw]:
+        if CHOICE_CONTEXT_RE.search(re.sub(r"[ \t]+", " ", line)):
+            return True
+    return bool(WRAPPED_CHOICE_CONTEXT_RE.search(re.sub(r"\s+", " ", raw)))
+
+
 def choice_context_lines(lines: list[str], start: int) -> list[str]:
     context: list[str] = []
     for line in lines[max(0, start - 5):start]:
@@ -2769,7 +2884,7 @@ def choice_context_lines(lines: list[str], start: int) -> list[str]:
         if (
             line_is_question_heading(line)
             or contains_marker(low, QUESTION_MARKERS)
-            or re.search(r"\b(choose|select|pick|approve|which (?:is it|one|path|option))\b", low)
+            or has_choice_context_hint(line)
             or is_action_question([line])
         ):
             context.append(line)
@@ -2781,11 +2896,10 @@ def choice_context_lines(lines: list[str], start: int) -> list[str]:
 def has_choice_context(lines: list[str]) -> bool:
     text = compact_block(lines, max_lines=5, max_chars=700)
     low = text.lower()
-    flat = re.sub(r"\s+", " ", low)
     return (
         any(line_is_question_heading(line) for line in lines)
         or contains_marker(low, QUESTION_MARKERS)
-        or bool(re.search(r"\b(choose|select|pick|approve|which (?:is it|one|path|option))\b", flat))
+        or has_choice_context_hint(text)
         or is_action_question(lines)
     )
 
@@ -4214,6 +4328,7 @@ def mark_rich_supported(telegram: dict[str, Any] | None) -> None:
     if rich:
         rich["supported"] = "yes"
         rich.pop("disabled_reason", None)
+        rich.pop("bad_request_streak", None)
         rich["last_ok_at"] = utc_now()
 
 
@@ -4223,6 +4338,28 @@ def mark_rich_disabled(telegram: dict[str, Any] | None, reason: str) -> None:
         rich["supported"] = "no"
         rich["disabled_reason"] = sanitize_text(reason, 300)
         rich["disabled_at"] = utc_now()
+
+
+def note_rich_bad_request(telegram: dict[str, Any] | None, reason: str) -> None:
+    # A structural rejection of our HTML repeats on every send; after a few in a
+    # row, latch rich off so we stop hammering the API and looping on the fallback.
+    rich = rich_telegram_state(telegram)
+    if not rich:
+        return
+    streak = int(rich.get("bad_request_streak") or 0) + 1
+    rich["bad_request_streak"] = streak
+    if streak >= RICH_BAD_REQUEST_LIMIT:
+        mark_rich_disabled(telegram, f"repeated bad_request: {reason}")
+
+
+def html_to_plain(html_text: str) -> str:
+    # Clean plain-text projection of rich HTML for the legacy sendMessage fallback:
+    # keeps line structure, never leaks raw markdown.
+    text = re.sub(r"</(?:blockquote|pre|p|h[1-6]|li|ul|ol|tr|details|summary|footer)>", "\n", html_text)
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _thread_payload(thread_id: str | int | None) -> dict[str, str]:
@@ -4327,7 +4464,7 @@ def send_rich_message(
     reply_markup: dict[str, Any] | None = None,
     reply_to_message_id: str | int | None = None,
 ) -> dict[str, Any]:
-    fallback = fallback_text or sanitize_text(html.unescape(re.sub(r"<[^>]+>", "", html_text)), MAX_REPLY_CHARS)
+    fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
     if not rich_enabled(telegram):
         return send_legacy_message_result(
             chat_id,
@@ -4374,6 +4511,7 @@ def send_rich_message(
             result["fallback_reason"] = kind
             return result
         if kind == "bad_request":
+            note_rich_bad_request(telegram, str(exc))
             result = send_legacy_message_result(
                 chat_id,
                 fallback,
@@ -4400,7 +4538,7 @@ def edit_rich_message(
     fallback_text: str = "",
     reply_markup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    fallback = fallback_text or sanitize_text(html.unescape(re.sub(r"<[^>]+>", "", html_text)), MAX_REPLY_CHARS)
+    fallback = fallback_text or sanitize_text(html_to_plain(html_text), MAX_REPLY_CHARS)
     if not rich_enabled(telegram):
         return edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup)
 
@@ -4431,6 +4569,7 @@ def edit_rich_message(
             legacy["fallback_reason"] = kind
             return legacy
         if kind == "bad_request":
+            note_rich_bad_request(telegram, str(exc))
             legacy = edit_message_text(chat_id, message_id, fallback, reply_markup=reply_markup)
             legacy["fallback_reason"] = kind
             return legacy
@@ -4454,7 +4593,6 @@ def send_feed_item(
         chat_id,
         render_feed_item_html(item, live=live),
         telegram=telegram,
-        fallback_text=item_plain_text(item),
         thread_id=thread_id,
         notify=notify,
         reply_markup=reply_markup,
@@ -4476,7 +4614,6 @@ def edit_feed_item(
         message_id,
         render_feed_item_html(item, live=live),
         telegram=telegram,
-        fallback_text=item_plain_text(item),
         reply_markup=reply_markup,
     )
 
