@@ -187,7 +187,7 @@ FENCE_START_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]{0,32})\s*$")
 TOKEN_CODE_RE = re.compile(
     r"(?<![\w/])("
     r"(?:~|/)[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+(?::\d+)?|"
-    r"\b[A-Z][A-Z0-9_]{2,}\b|"
+    r"\b[A-Z][A-Z0-9_]*[_0-9][A-Z0-9_]*\b|"
     r"\b[A-Za-z_][A-Za-z0-9_]*\.(?:py|json|toml|service|timer|sh|md|txt|yaml|yml)\b(?::\d+)?|"
     r"\b[A-Za-z_][A-Za-z0-9_]*=\S+\b|"
     r"\b(?:sendRichMessage|editForumTopic|editMessageText|createForumTopic)\b|"
@@ -1706,7 +1706,7 @@ def looks_like_path_or_symbol(value: str) -> bool:
     clean = str(value or "").strip()
     if not clean or len(clean.split()) > 3:
         return False
-    if re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", clean):
+    if re.fullmatch(r"[A-Z][A-Z0-9_]*[_0-9][A-Z0-9_]*", clean):
         return True
     if re.fullmatch(r"[0-9a-f]{7,40}", clean, re.IGNORECASE):
         return True
@@ -2428,6 +2428,26 @@ def _rich_paragraph_blocks(value: str) -> list[str]:
     return [block for block in (_rich_paragraph(chunk) for chunk in _split_long_paragraph(value)) if block]
 
 
+TEXT_FENCE_LANGS = {"text", "txt", "plain", "plaintext", "markdown", "md"}
+
+
+def _render_text_fence(code_lines: list[str]) -> str:
+    # Codex wraps prose / numbered steps / field lists in ```text fences. Render
+    # them as readable text (line breaks preserved via <br>, blank lines as gaps),
+    # not a monospace code block.
+    groups: list[list[str]] = [[]]
+    for ln in code_lines:
+        if not ln.strip():
+            if groups[-1]:
+                groups.append([])
+            continue
+        rendered = _rich_inline(ln, 900)
+        if rendered:
+            groups[-1].append(rendered)
+    blocks = ["<br>".join(g) for g in groups if g]
+    return "<br><br>".join(blocks)
+
+
 def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) -> str:
     parts: list[str] = []
     idx = 0
@@ -2456,6 +2476,12 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 idx += 1
             if idx < len(lines):
                 idx += 1
+            if language.lower() in TEXT_FENCE_LANGS:
+                rendered_fence = _render_text_fence(code_lines)
+                if rendered_fence:
+                    parts.append(rendered_fence)
+                previous_blank = False
+                continue
             class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
             parts.append(f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), 3000)}</code></pre>")
             previous_blank = False
