@@ -798,6 +798,114 @@ Verification
         self.assertEqual(records[0]["active_key"], "active")
         self.assertEqual(records[0]["topic_id"], "13")
 
+    def test_status_marker_content_includes_workflow_counts(self) -> None:
+        pane = {
+            "agent_status": "working",
+            "workflow_counts": {"done": 2, "total": 5, "active": 1},
+        }
+
+        title, body = herdres.status_marker_content(pane)
+
+        self.assertEqual(title, "🟡 Working")
+        self.assertEqual(body, "Working on 2/5 workflows; 1 active.")
+
+    def test_sync_sends_status_marker_and_deletes_previous_marker(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "working",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "status_marker_message_id": "10",
+            "status_marker_hash": "old",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        send_notice = Mock(return_value={"ok": True, "message_id": "11"})
+        delete_message = Mock(return_value=True)
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_structured_turn_source"}),
+            send_notice=send_notice,
+            delete_message=delete_message,
+            STATUS_MARKER_ENABLED=True,
+            LIVE_CARD_ENABLED=True,
+            TURN_FEED_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["sent"], 1)
+        send_notice.assert_called_once()
+        self.assertEqual(send_notice.call_args.args[1], "🟡 Working")
+        delete_message.assert_called_once_with("-1001", "10")
+        self.assertEqual(entry["status_marker_message_id"], "11")
+
+    def test_sync_does_not_resend_unchanged_status_marker(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "status_marker_message_id": "10",
+            "status_marker_hash": herdres.status_marker_hash(pane),
+            "last_turn_available": False,
+            "last_turn_reason": "no_structured_turn_source",
+            "last_topic_verified_at": herdres.utc_now(),
+            "last_status_hash": herdres.status_hash(herdres.stable_status_object(pane)),
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        send_notice = Mock()
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_structured_turn_source"}),
+            send_notice=send_notice,
+            STATUS_MARKER_ENABLED=True,
+            LIVE_CARD_ENABLED=True,
+            TURN_FEED_ENABLED=True,
+        ):
+            result = herdres.sync_once()
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["sent"], 0)
+        send_notice.assert_not_called()
+
     def test_cleanup_duplicates_delete_archives_closed_entry(self) -> None:
         state = {
             "version": 1,
@@ -1117,6 +1225,7 @@ What changed:
             pane_turn=pane_turn,
             TURN_FEED_ENABLED=True,
             LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
         ):
             result = herdres.sync_once()
 

@@ -56,6 +56,13 @@ CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() 
 TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "0").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
+STATUS_MARKER_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "1").lower() in {"1", "true", "yes", "on"}
+STATUS_MARKER_DELETE_OLD = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "0").lower() in {
     "1",
     "true",
@@ -2433,6 +2440,10 @@ def clear_topic_mapping(entry: dict[str, Any], reason: str = "") -> None:
         "card_hash",
         "card_status_hash",
         "card_format",
+        "status_marker_message_id",
+        "status_marker_hash",
+        "status_marker_text",
+        "status_marker_sent_at",
         "last_status_hash",
         "last_notified_status",
         "last_sent_at",
@@ -2566,6 +2577,8 @@ def format_debug(pane: dict[str, Any] | None, entry: dict[str, Any]) -> str:
         f"card_hash: {entry.get('card_hash') or ''}",
         f"card_status_hash: {entry.get('card_status_hash') or ''}",
         f"card_format: {entry.get('card_format') or ''}",
+        f"status_marker_message_id: {entry.get('status_marker_message_id') or ''}",
+        f"status_marker_hash: {entry.get('status_marker_hash') or ''}",
         f"last_seen_at: {entry.get('last_seen_at') or ''}",
     ]
     if pane:
@@ -2646,6 +2659,71 @@ def live_status_item(pane: dict[str, Any]) -> dict[str, Any]:
     if status in {"unknown"}:
         return make_feed_item("status", "Status", "Current pane state is unclear.", notify=False)
     return make_feed_item("status", "Working", "Work is in progress.", notify=False)
+
+
+def workflow_summary(pane: dict[str, Any]) -> str:
+    counts = pane.get("workflow_counts")
+    if isinstance(counts, dict):
+        total = int(counts.get("total") or counts.get("count") or 0)
+        done = int(counts.get("done") or counts.get("completed") or counts.get("succeeded") or 0)
+        active = int(counts.get("active") or counts.get("running") or counts.get("working") or 0)
+        if total:
+            if active:
+                return f"Working on {done}/{total} workflows; {active} active."
+            return f"Workflows {done}/{total}."
+    workflows = pane.get("workflows")
+    if isinstance(workflows, list) and workflows:
+        total = len(workflows)
+        done = 0
+        active = 0
+        for workflow in workflows:
+            if not isinstance(workflow, dict):
+                continue
+            status = str(workflow.get("status") or workflow.get("state") or "").lower()
+            if status in {"done", "complete", "completed", "succeeded", "success"}:
+                done += 1
+            elif status in {"active", "running", "working", "in_progress", "pending"}:
+                active += 1
+        if active:
+            return f"Working on {done}/{total} workflows; {active} active."
+        return f"Workflows {done}/{total}."
+    total_raw = pane.get("workflow_total") or pane.get("workflows_total")
+    done_raw = pane.get("workflow_done") or pane.get("workflows_done") or pane.get("workflow_completed")
+    try:
+        total = int(total_raw or 0)
+        done = int(done_raw or 0)
+    except Exception:
+        return ""
+    if total:
+        return f"Working on {done}/{total} workflows."
+    return ""
+
+
+def status_marker_content(pane: dict[str, Any]) -> tuple[str, str]:
+    status = str(pane.get("agent_status") or "unknown").lower()
+    workflows = workflow_summary(pane)
+    if status == "working":
+        return "🟡 Working", workflows or "Work is in progress."
+    if status == "idle":
+        return "🟢 Idle", workflows or "No active work."
+    if status == "done":
+        return "✅ Done", workflows or "Latest work finished."
+    if status == "blocked":
+        return "🟠 Waiting", workflows or "Waiting for input or blocked."
+    if status == "error":
+        return "🔴 Error", workflows or "This pane reported an error."
+    return "⚪ Status", workflows or "Current pane state is unclear."
+
+
+def status_marker_hash(pane: dict[str, Any]) -> str:
+    title, body = status_marker_content(pane)
+    payload = {
+        "version": 1,
+        "status": str(pane.get("agent_status") or "unknown").lower(),
+        "title": title,
+        "body": body,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
@@ -3199,6 +3277,41 @@ def update_live_card(
     return {**result, "attempted": True}
 
 
+def update_status_marker(
+    chat_id: str,
+    entry: dict[str, Any],
+    pane: dict[str, Any],
+    *,
+    telegram: dict[str, Any],
+) -> dict[str, Any]:
+    marker_hash = status_marker_hash(pane)
+    if marker_hash == entry.get("status_marker_hash") and entry.get("status_marker_message_id"):
+        return {"ok": True, "kind": "unchanged", "attempted": False}
+    title, body = status_marker_content(pane)
+    old_message_id = str(entry.get("status_marker_message_id") or "")
+    result = send_notice(
+        chat_id,
+        title,
+        body,
+        telegram=telegram,
+        thread_id=entry.get("topic_id"),
+        notify=False,
+    )
+    if result.get("ok"):
+        new_message_id = str(result.get("message_id") or "")
+        if old_message_id and new_message_id and old_message_id != new_message_id and STATUS_MARKER_DELETE_OLD:
+            try:
+                delete_message(chat_id, old_message_id)
+            except Exception:
+                entry["last_status_marker_delete_error"] = utc_now()
+        if new_message_id:
+            entry["status_marker_message_id"] = new_message_id
+        entry["status_marker_hash"] = marker_hash
+        entry["status_marker_text"] = sanitize_text(f"{title}\n{body}", 500)
+        entry["status_marker_sent_at"] = utc_now()
+    return {**result, "attempted": True}
+
+
 def create_topic(chat_id: str, name: str) -> str:
     payload: dict[str, Any] = {"chat_id": chat_id, "name": name}
     if HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID:
@@ -3226,6 +3339,11 @@ def edit_topic(chat_id: str, topic_id: str | int, name: str) -> bool:
 def delete_topic(chat_id: str, topic_id: str | int) -> bool:
     payload = {"chat_id": chat_id, "message_thread_id": str(topic_id)}
     return bool(telegram_api("deleteForumTopic", payload).get("result"))
+
+
+def delete_message(chat_id: str, message_id: str | int) -> bool:
+    payload = {"chat_id": chat_id, "message_id": str(message_id)}
+    return bool(telegram_api("deleteMessage", payload).get("result"))
 
 
 def preflight(chat_id: str) -> None:
@@ -3524,7 +3642,7 @@ def sync_pane_once(
     stable_obj_hash = status_hash(stable_status_object(pane))
     live_item = live_status_item(pane)
     live_card_hash = clean_feed_hash(live_item)
-    if LIVE_CARD_ENABLED and counters.get("sends", 0) < max_sends and (
+    if LIVE_CARD_ENABLED and not STATUS_MARKER_ENABLED and counters.get("sends", 0) < max_sends and (
         not entry.get("card_message_id") or entry.get("card_status_hash") != live_card_hash
     ):
         card_result = update_live_card(chat_id, entry, live_item, telegram=telegram)
@@ -3680,6 +3798,16 @@ def sync_pane_once(
             clear_topic_mapping(entry, str(status_result.get("error") or status_result))
             save_state(state)
             return True
+    if STATUS_MARKER_ENABLED and entry.get("topic_id") and counters.get("sends", 0) < max_sends:
+        marker_result = update_status_marker(chat_id, entry, pane, telegram=telegram)
+        if marker_result.get("attempted"):
+            counters["sends"] = counters.get("sends", 0) + 1
+        if result_topic_missing(marker_result):
+            clear_topic_mapping(entry, str(marker_result.get("error") or marker_result))
+            save_state(state)
+            return True
+        if marker_result.get("ok") and marker_result.get("attempted"):
+            changed = True
     return changed
 
 

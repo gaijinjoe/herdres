@@ -13,7 +13,8 @@ It does not patch Hermes or Herdr core files and routine sync uses no LLM calls.
 - Creates or maintains one Telegram forum topic per Herdr pane.
 - Keeps the General topic free for your normal Hermes chat.
 - Sends pane updates with Telegram Bot API 10.1 `sendRichMessage`.
-- Uses `editMessageText(rich_message=...)` for a quiet live status card.
+- Can use `editMessageText(rich_message=...)` for a quiet live status card when bottom status markers are disabled.
+- Posts a compact bottom-of-topic status marker, such as `🟡 Working` or `🟢 Idle`, only when status changes.
 - Shows clean reports, questions, blockers, numbered choices, and structured decision buttons.
 - Optionally shows only the last submitted user instruction plus the final assistant reply when `herdr pane turn` is available.
 - Keeps raw transcript and technical metadata behind explicit commands.
@@ -174,6 +175,34 @@ Fallback policy:
 - Transient/network error: do not resend, to avoid duplicate posts
 - Live-card edits retry naturally on the next timer tick
 
+## Topic Status Markers
+
+Telegram does not move edited messages to the bottom of a topic. To keep each pane topic glanceable, Herdres can post a compact status marker as the latest message in the mapped topic:
+
+```text
+🟡 Working
+Work is in progress.
+
+🟢 Idle
+No active work.
+```
+
+The marker is low-noise: it is sent only when the compact status changes. When possible, Herdres deletes the previous marker after posting the new one, so each topic keeps one current status marker near the bottom. Final replies and decision cards are still delivered normally; the status marker is sent after them so the topic list shows the current pane state.
+
+If Herdr exposes workflow metadata, Herdres includes it in the marker, for example:
+
+```text
+🟡 Working
+Working on 2/5 workflows; 1 active.
+```
+
+Controls:
+
+```bash
+HERDR_TELEGRAM_TOPICS_STATUS_MARKER=1
+HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD=1
+```
+
 ## Structured Turn Feed
 
 The cleanest mode is `HERDR_TELEGRAM_TOPICS_TURN_FEED=1`. In this mode Herdres does not infer reports, questions, or updates from terminal text. It calls:
@@ -328,6 +357,8 @@ HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS=1200
 HERDR_TELEGRAM_TOPICS_RICH_MESSAGES=1
 HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS=14000
 HERDR_TELEGRAM_TOPICS_LIVE_CARD=1
+HERDR_TELEGRAM_TOPICS_STATUS_MARKER=1
+HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD=1
 HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=0
 HERDR_TELEGRAM_TOPICS_DRY_RUN=0
 ```
