@@ -3811,6 +3811,19 @@ Verification
             "panes": {"pane-1": entry},
         }
         send_feed_item = Mock(return_value={"ok": True, "message_id": "1001"})
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "awaiting_input": True,
+                "turn_id": "turn-1",
+                "pending_decision": {
+                    "decision_id": "turn-1:decision-1",
+                    "prompt": "How should I proceed now?",
+                    "options": [{"id": "build", "label": "Build current path", "send_text": "2"}],
+                },
+            }
+        )
 
         with patch.multiple(
             herdres,
@@ -3818,6 +3831,7 @@ Verification
             load_state=Mock(return_value=state),
             save_state=Mock(),
             send_feed_item=send_feed_item,
+            pane_turn=pane_turn,
             STRUCTURED_INTERACTIONS_ENABLED=True,
         ):
             result = herdres.command_reply(
@@ -3828,6 +3842,121 @@ Verification
         self.assertEqual(result["reply"], "")
         send_feed_item.assert_called_once()
         self.assertIsNotNone(send_feed_item.call_args.kwargs["reply_markup"])
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["summary"], "How should I proceed now?")
+        self.assertEqual(sent_item["options"][0]["label"], "Build current path")
+        self.assertEqual(entry["active_prompt"]["options"][0]["send_text"], "2")
+        self.assertEqual(entry["active_prompt"]["message_id"], "1001")
+
+    def test_choices_command_clears_confirmed_stale_pending_decision(self) -> None:
+        entry = {
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "active_prompt": test_active_prompt({
+                "id": "decision1",
+                "text": "How should I proceed?\n1) Build",
+                "choice_source": "pending_decision",
+                "decision_id": "turn-1:decision-1",
+                "item": {
+                    "kind": "decision",
+                    "choice_source": "pending_decision",
+                    "prompt_id": "decision1",
+                    "decision_id": "turn-1:decision-1",
+                    "summary": "How should I proceed?",
+                    "options": [{"number": "1", "callback_id": "build", "label": "Build", "send_text": "1"}],
+                },
+                "options": [{"number": "1", "callback_id": "build", "label": "Build", "send_text": "1"}],
+            }),
+            "awaiting_detail": {
+                "user_id": "42",
+                "prompt_id": "decision1",
+                "choice": "1",
+                "created_at": herdres.utc_now(),
+            },
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {"pane-1": entry},
+        }
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1001"})
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": True,
+                "turn_id": "turn-2",
+                "assistant_final_text": "Already moved on.",
+            }
+        )
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            send_feed_item=send_feed_item,
+            pane_turn=pane_turn,
+            STRUCTURED_INTERACTIONS_ENABLED=True,
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/choices"}
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "No active choices for this pane.")
+        send_feed_item.assert_not_called()
+        self.assertNotIn("active_prompt", entry)
+        self.assertNotIn("awaiting_detail", entry)
+
+    def test_choices_command_keeps_prompt_when_turn_revalidation_unavailable(self) -> None:
+        entry = {
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "active_prompt": test_active_prompt({
+                "id": "decision1",
+                "text": "How should I proceed?\n1) Build",
+                "choice_source": "pending_decision",
+                "decision_id": "turn-1:decision-1",
+                "item": {
+                    "kind": "decision",
+                    "choice_source": "pending_decision",
+                    "prompt_id": "decision1",
+                    "decision_id": "turn-1:decision-1",
+                    "summary": "How should I proceed?",
+                    "options": [{"number": "1", "callback_id": "build", "label": "Build", "send_text": "1"}],
+                },
+                "options": [{"number": "1", "callback_id": "build", "label": "Build", "send_text": "1"}],
+            }),
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {"pane-1": entry},
+        }
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1001"})
+        pane_turn = Mock(return_value={"available": False, "reason": "temporary_turn_read_failure"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            send_feed_item=send_feed_item,
+            pane_turn=pane_turn,
+            STRUCTURED_INTERACTIONS_ENABLED=True,
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/choices"}
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "")
+        send_feed_item.assert_called_once()
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["summary"], "How should I proceed?")
+        self.assertIn("active_prompt", entry)
         self.assertEqual(entry["active_prompt"]["message_id"], "1001")
 
     def test_choices_command_without_message_id_clears_active_prompt(self) -> None:

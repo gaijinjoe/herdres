@@ -3218,6 +3218,35 @@ def latest_turn_report(entry: dict[str, Any], pane: dict[str, Any] | None = None
     return "No structured turn is available yet."
 
 
+def revalidate_pending_decision_prompt(
+    pane_id: str,
+    prompt: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    if not TURN_FEED_ENABLED or not STRUCTURED_INTERACTIONS_ENABLED:
+        return "unknown", None
+    if prompt_source(prompt) != "pending_decision":
+        return "unknown", None
+    decision_id = str(prompt.get("decision_id") or "").strip()
+    if not decision_id:
+        item = prompt.get("item") if isinstance(prompt.get("item"), dict) else {}
+        decision_id = str(item.get("decision_id") or "").strip()
+    if not pane_id or not decision_id:
+        return "unknown", None
+
+    turn = pane_turn(pane_id)
+    if turn.get("available") is not True:
+        return "unknown", None
+
+    decision = normalize_pending_decision(turn)
+    if not decision or str(decision.get("decision_id") or "").strip() != decision_id:
+        return "stale", None
+
+    item = make_decision_feed_item(turn, decision)
+    if not item:
+        return "unknown", None
+    return "fresh", item
+
+
 def live_status_item(pane: dict[str, Any]) -> dict[str, Any]:
     status = str(pane.get("agent_status") or "unknown").lower()
     if status in {"blocked"}:
@@ -5451,6 +5480,29 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             return {"handled": True, "reply": "No active choices for this pane."}
         if not prompt_id or not options or not prompt_text:
             return {"handled": True, "reply": "No active choices for this pane."}
+        revalidation, fresh_prompt_item = revalidate_pending_decision_prompt(pane_id, prompt)
+        if revalidation == "stale":
+            entry.pop("active_prompt", None)
+            entry.pop("awaiting_detail", None)
+            save_state(state)
+            return {"handled": True, "reply": "No active choices for this pane."}
+        if fresh_prompt_item:
+            reply_markup, pending_active_prompt, clear_active_prompt = prompt_delivery_state(fresh_prompt_item)
+            result = send_feed_item(
+                chat_id,
+                fresh_prompt_item,
+                telegram=telegram,
+                thread_id=topic_id,
+                notify=True,
+                reply_markup=reply_markup,
+            )
+            if result.get("ok") and pending_active_prompt:
+                bind_active_prompt_message(entry, pending_active_prompt, result.get("message_id"))
+            elif result.get("ok") and clear_active_prompt:
+                entry.pop("active_prompt", None)
+                entry.pop("awaiting_detail", None)
+            save_state(state)
+            return {"handled": True, "reply": ""}
         prompt_item = dict(prompt.get("item") or {})
         if not prompt_item:
             question_lines = [ln for ln in feed_body_lines("Question", prompt_text) if not option_match(ln)]
