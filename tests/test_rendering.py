@@ -12,6 +12,13 @@ SPEC.loader.exec_module(herdres)
 
 
 class RenderingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._status_icon_patch = patch.object(herdres, "STATUS_ICON_ENABLED", False)
+        self._status_icon_patch.start()
+
+    def tearDown(self) -> None:
+        self._status_icon_patch.stop()
+
     def test_preserves_report_structure_for_telegram_rich_html(self) -> None:
         sample = """\u2022 Fixed. The renderer was incorrectly turning every line
 into a bullet list and only capturing the tail of the
@@ -905,6 +912,72 @@ Verification
         self.assertFalse(result["changed"])
         self.assertEqual(result["sent"], 0)
         send_notice.assert_not_called()
+
+    def test_status_icon_update_suppresses_marker_message_when_available(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "working",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "status_marker_message_id": "10",
+            "status_marker_hash": "old",
+            "last_topic_verified_at": herdres.utc_now(),
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        calls = []
+
+        def telegram_api(method, payload):
+            calls.append((method, payload))
+            if method == "getForumTopicIconStickers":
+                return {"ok": True, "result": [{"emoji": "⚡️", "custom_emoji_id": "icon-working"}]}
+            if method == "editForumTopic":
+                return {"ok": True, "result": True}
+            return {"ok": True, "result": True}
+
+        send_notice = Mock(return_value={"ok": True, "message_id": "11"})
+        delete_message = Mock(return_value=True)
+
+        with patch.object(herdres, "STATUS_ICON_ENABLED", True), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_structured_turn_source"}),
+            telegram_api=telegram_api,
+            send_notice=send_notice,
+            delete_message=delete_message,
+            TURN_FEED_ENABLED=True,
+            STATUS_MARKER_ENABLED=True,
+            STATUS_MARKER_SUPPRESS_WHEN_ICON_OK=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["icon_updated"], 1)
+        self.assertEqual(result["marker_sent"], 0)
+        self.assertEqual(entry["topic_status_icon_custom_emoji_id"], "icon-working")
+        self.assertEqual(entry["topic_status_icon_key"], "working")
+        self.assertNotIn("status_marker_message_id", entry)
+        self.assertEqual(calls[-1][0], "editForumTopic")
+        self.assertEqual(calls[-1][1]["icon_custom_emoji_id"], "icon-working")
+        send_notice.assert_not_called()
+        delete_message.assert_called_once_with("-1001", "10")
 
     def test_cleanup_duplicates_delete_archives_closed_entry(self) -> None:
         state = {
@@ -2610,6 +2683,62 @@ Verification
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["changed"])
+        self.assertEqual(result["feed_sent"], 1)
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(sync_pane_once.call_count, 2)
+
+    def test_event_keeps_settling_after_initial_turn_unavailable(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "done",
+        }
+        key = herdres.pane_key(pane)
+        state = {
+            "version": 1,
+            "enabled": True,
+            "plugin_event_enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {
+                key: {
+                    "pane_key": key,
+                    "pane_id": "pane-1",
+                    "topic_id": "77",
+                    "last_topic_verified_at": herdres.utc_now(),
+                }
+            },
+        }
+        event_json = herdres.json.dumps({"pane": {"pane_id": "pane-1"}, "agent_status": "done"})
+        sync_pane_once = Mock()
+
+        def wrapped_sync(*args, **kwargs):
+            entry = args[0]["panes"][key]
+            if sync_pane_once.call_count == 1:
+                entry["last_turn_available"] = False
+                return True
+            args[4]["feed_sends"] = args[4].get("feed_sends", 0) + 1
+            args[4]["sends"] = args[4].get("sends", 0) + 1
+            entry["last_turn_available"] = True
+            return True
+
+        with patch.dict(herdres.os.environ, {"HERDR_PLUGIN_EVENT_JSON": event_json}, clear=False), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_by_id=Mock(return_value=pane),
+            preflight_for_event=Mock(return_value=(True, "")),
+            sync_pane_once=sync_pane_once,
+            EVENT_SETTLE_SECONDS=0.05,
+            EVENT_SETTLE_INTERVAL_SECONDS=0.01,
+        ):
+            sync_pane_once.side_effect = wrapped_sync
+            result = herdres.event_once()
+
+        self.assertTrue(result["ok"])
         self.assertEqual(result["feed_sent"], 1)
         self.assertEqual(result["attempts"], 2)
         self.assertEqual(sync_pane_once.call_count, 2)

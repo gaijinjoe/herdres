@@ -53,6 +53,13 @@ TOPIC_VERIFY_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_VERIFY_TTL", "90
 MAX_TOPIC_VERIFIES_PER_RUN = int(os.getenv("HERDR_TELEGRAM_TOPICS_MAX_VERIFIES", "3"))
 HERDR_TOPIC_ICON_COLOR = int(os.getenv("HERDR_TELEGRAM_TOPICS_ICON_COLOR", DEFAULT_HERDR_TOPIC_ICON_COLOR))
 HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID = os.getenv("HERDR_TELEGRAM_TOPICS_ICON_CUSTOM_EMOJI_ID", "").strip()
+STATUS_ICON_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON", "1").lower() in {"1", "true", "yes", "on"}
+STATUS_ICON_CACHE_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON_CACHE_TTL", "86400"))
+STATUS_ICON_RETRY_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_ICON_RETRY", "300"))
+STATUS_MARKER_SUPPRESS_WHEN_ICON_OK = os.getenv(
+    "HERDR_TELEGRAM_TOPICS_STATUS_MARKER_SUPPRESS_WHEN_ICON_OK",
+    "1",
+).lower() in {"1", "true", "yes", "on"}
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "0").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
@@ -2727,6 +2734,181 @@ def status_marker_hash(pane: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+STATUS_ICON_ENV_KEYS = {
+    "working": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING",
+    "idle": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE",
+    "done": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE",
+    "blocked": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED",
+    "error": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR",
+    "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW",
+    "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN",
+}
+
+STATUS_ICON_EMOJI_ENV_KEYS = {
+    "working": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING_EMOJI",
+    "idle": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE_EMOJI",
+    "done": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE_EMOJI",
+    "blocked": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED_EMOJI",
+    "error": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR_EMOJI",
+    "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW_EMOJI",
+    "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN_EMOJI",
+}
+
+STATUS_ICON_DEFAULT_EMOJI = {
+    "working": "⚡️",
+    "idle": "☕️",
+    "done": "✅",
+    "blocked": "❗️",
+    "error": "‼️",
+    "workflow": "📈",
+    "unknown": "❓",
+}
+
+
+def status_icon_key(pane: dict[str, Any]) -> str:
+    status = str(pane.get("agent_status") or "unknown").lower()
+    if status == "working" and workflow_summary(pane):
+        return "workflow"
+    if status in {"working", "idle", "done", "blocked", "error"}:
+        return status
+    return "unknown"
+
+
+def status_icon_emoji(key: str) -> str:
+    env_key = STATUS_ICON_EMOJI_ENV_KEYS.get(key, "")
+    return (os.getenv(env_key, "") if env_key else "").strip() or STATUS_ICON_DEFAULT_EMOJI.get(key, "❓")
+
+
+def status_icon_explicit_id(key: str) -> str:
+    env_key = STATUS_ICON_ENV_KEYS.get(key, "")
+    return (os.getenv(env_key, "") if env_key else "").strip()
+
+
+def cache_fresh(value: str, ttl_seconds: int) -> bool:
+    try:
+        then = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    return (_dt.datetime.now(tz=_dt.timezone.utc) - then).total_seconds() <= ttl_seconds
+
+
+def forum_icon_cache(telegram: dict[str, Any]) -> dict[str, Any]:
+    cache = telegram.setdefault("forum_topic_icons", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        telegram["forum_topic_icons"] = cache
+    cache.setdefault("by_emoji", {})
+    return cache
+
+
+def refresh_forum_icon_cache(telegram: dict[str, Any]) -> dict[str, Any]:
+    cache = forum_icon_cache(telegram)
+    fetched_at = str(cache.get("fetched_at") or "")
+    if cache.get("by_emoji") and cache_fresh(fetched_at, STATUS_ICON_CACHE_TTL_SECONDS):
+        return cache
+    response = telegram_api("getForumTopicIconStickers", {})
+    by_emoji: dict[str, str] = {}
+    for sticker in response.get("result") or []:
+        if not isinstance(sticker, dict):
+            continue
+        emoji = str(sticker.get("emoji") or "").strip()
+        custom_emoji_id = str(sticker.get("custom_emoji_id") or "").strip()
+        if emoji and custom_emoji_id and emoji not in by_emoji:
+            by_emoji[emoji] = custom_emoji_id
+    cache["by_emoji"] = by_emoji
+    cache["fetched_at"] = utc_now()
+    cache.pop("last_error", None)
+    cache.pop("last_error_at", None)
+    return cache
+
+
+def status_icon_custom_emoji_id(telegram: dict[str, Any], pane: dict[str, Any]) -> tuple[str, str, str]:
+    key = status_icon_key(pane)
+    keys = [key]
+    if key == "workflow":
+        keys.append("working")
+    keys.append("unknown")
+    for candidate in keys:
+        explicit = status_icon_explicit_id(candidate)
+        if explicit:
+            return explicit, candidate, status_icon_emoji(candidate)
+    try:
+        cache = refresh_forum_icon_cache(telegram)
+    except Exception as exc:
+        cache = forum_icon_cache(telegram)
+        cache["last_error"] = sanitize_text(str(exc), 500)
+        cache["last_error_at"] = utc_now()
+        return "", key, status_icon_emoji(key)
+    by_emoji = cache.get("by_emoji") if isinstance(cache.get("by_emoji"), dict) else {}
+    for candidate in keys:
+        emoji = status_icon_emoji(candidate)
+        custom_emoji_id = str(by_emoji.get(emoji) or "").strip()
+        if custom_emoji_id:
+            return custom_emoji_id, candidate, emoji
+    return "", key, status_icon_emoji(key)
+
+
+def edit_topic_icon(chat_id: str, topic_id: str | int, icon_custom_emoji_id: str) -> bool:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_thread_id": str(topic_id),
+        "icon_custom_emoji_id": icon_custom_emoji_id,
+    }
+    return bool(telegram_api("editForumTopic", payload).get("result"))
+
+
+def update_topic_status_icon(
+    chat_id: str,
+    entry: dict[str, Any],
+    pane: dict[str, Any],
+    *,
+    telegram: dict[str, Any],
+) -> dict[str, Any]:
+    if not STATUS_ICON_ENABLED:
+        return {"ok": False, "attempted": False, "kind": "disabled"}
+    topic_id = str(entry.get("topic_id") or "")
+    if not topic_id:
+        return {"ok": False, "attempted": False, "kind": "missing_topic"}
+    icon_id, icon_key, emoji = status_icon_custom_emoji_id(telegram, pane)
+    if not icon_id:
+        entry["last_topic_status_icon_missing"] = icon_key
+        entry["last_topic_status_icon_missing_emoji"] = emoji
+        entry["last_topic_status_icon_missing_at"] = utc_now()
+        return {"ok": False, "attempted": False, "kind": "no_icon", "icon_key": icon_key, "emoji": emoji}
+    if str(entry.get("topic_status_icon_custom_emoji_id") or "") == icon_id:
+        return {"ok": True, "attempted": False, "kind": "unchanged", "icon_key": icon_key, "emoji": emoji}
+    retry_key = f"{icon_id}:{icon_key}"
+    if str(entry.get("last_topic_status_icon_attempt_key") or "") == retry_key:
+        last_attempt = str(entry.get("last_topic_status_icon_attempt_at") or "")
+        if last_attempt and cache_fresh(last_attempt, STATUS_ICON_RETRY_SECONDS):
+            return {"ok": False, "attempted": False, "kind": "retry_deferred", "icon_key": icon_key, "emoji": emoji}
+    entry["last_topic_status_icon_attempt_key"] = retry_key
+    entry["last_topic_status_icon_attempt_at"] = utc_now()
+    try:
+        ok = edit_topic_icon(chat_id, topic_id, icon_id)
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        kind = classify_telegram_error(exc)
+        entry["last_topic_status_icon_error"] = sanitize_text(str(exc), 500)
+        entry["last_topic_status_icon_error_at"] = utc_now()
+        result = {"ok": False, "attempted": True, "kind": kind, "error": str(exc), "icon_key": icon_key, "emoji": emoji}
+        if kind == "topic_not_found":
+            result["topic_missing"] = True
+        return result
+    if ok:
+        entry["topic_status_icon_key"] = icon_key
+        entry["topic_status_icon_emoji"] = emoji
+        entry["topic_status_icon_custom_emoji_id"] = icon_id
+        entry["topic_status_icon_updated_at"] = utc_now()
+        entry.pop("last_topic_status_icon_error", None)
+        entry.pop("last_topic_status_icon_error_at", None)
+        entry.pop("last_topic_status_icon_missing", None)
+        entry.pop("last_topic_status_icon_missing_emoji", None)
+        entry.pop("last_topic_status_icon_missing_at", None)
+    return {"ok": bool(ok), "attempted": True, "kind": "updated" if ok else "failed", "icon_key": icon_key, "emoji": emoji}
+
+
 def send_to_pane(pane_id: str, text: str, *, timeout: int = 8) -> tuple[bool, str]:
     pane = pane_by_id(pane_id)
     if not pane:
@@ -2765,6 +2947,19 @@ def dry_run_result(method: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "result": {"status": "administrator", "can_manage_topics": True}}
     if method == "createForumTopic":
         return {"ok": True, "result": {"message_thread_id": now_id}}
+    if method == "getForumTopicIconStickers":
+        return {
+            "ok": True,
+            "result": [
+                {"emoji": "⚡️", "custom_emoji_id": "dry-working"},
+                {"emoji": "☕️", "custom_emoji_id": "dry-idle"},
+                {"emoji": "✅", "custom_emoji_id": "dry-done"},
+                {"emoji": "❗️", "custom_emoji_id": "dry-blocked"},
+                {"emoji": "‼️", "custom_emoji_id": "dry-error"},
+                {"emoji": "📈", "custom_emoji_id": "dry-workflow"},
+                {"emoji": "❓", "custom_emoji_id": "dry-unknown"},
+            ],
+        }
     if method in {"sendMessage", "sendRichMessage", "editMessageText"}:
         return {"ok": True, "result": {"message_id": now_id}}
     return {"ok": True, "result": True}
@@ -3313,9 +3508,31 @@ def update_status_marker(
     return {**result, "attempted": True}
 
 
-def create_topic(chat_id: str, name: str) -> str:
+def clear_status_marker_for_icon(chat_id: str, entry: dict[str, Any]) -> bool:
+    old_message_id = str(entry.get("status_marker_message_id") or "")
+    if not old_message_id:
+        return False
+    if STATUS_MARKER_DELETE_OLD:
+        try:
+            delete_message(chat_id, old_message_id)
+        except Exception:
+            entry["last_status_marker_delete_error"] = utc_now()
+    for key in (
+        "status_marker_message_id",
+        "status_marker_hash",
+        "status_marker_text",
+        "status_marker_sent_at",
+    ):
+        entry.pop(key, None)
+    entry["status_marker_cleared_for_icon_at"] = utc_now()
+    return True
+
+
+def create_topic(chat_id: str, name: str, *, icon_custom_emoji_id: str = "") -> str:
     payload: dict[str, Any] = {"chat_id": chat_id, "name": name}
-    if HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID:
+    if icon_custom_emoji_id:
+        payload["icon_custom_emoji_id"] = icon_custom_emoji_id
+    elif HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID:
         payload["icon_custom_emoji_id"] = HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID
     else:
         payload["icon_color"] = str(HERDR_TOPIC_ICON_COLOR)
@@ -3326,14 +3543,14 @@ def create_topic(chat_id: str, name: str) -> str:
     return str(topic_id)
 
 
-def edit_topic(chat_id: str, topic_id: str | int, name: str) -> bool:
+def edit_topic(chat_id: str, topic_id: str | int, name: str, *, icon_custom_emoji_id: str | None = None) -> bool:
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "message_thread_id": str(topic_id),
         "name": name,
     }
-    if HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID:
-        payload["icon_custom_emoji_id"] = HERDR_TOPIC_ICON_CUSTOM_EMOJI_ID
+    if icon_custom_emoji_id:
+        payload["icon_custom_emoji_id"] = icon_custom_emoji_id
     return bool(telegram_api("editForumTopic", payload).get("result"))
 
 
@@ -3600,10 +3817,21 @@ def sync_pane_once(
 
     if not entry.get("topic_id") and counters.get("creates", 0) < max_creates:
         topic_name = str(entry.get("topic_name") or topic_name_for_pane(pane))
-        topic_id = create_topic(chat_id, topic_name)
+        topic_icon_id = ""
+        topic_icon_key = ""
+        topic_icon_emoji = ""
+        if STATUS_ICON_ENABLED:
+            topic_icon_id, topic_icon_key, topic_icon_emoji = status_icon_custom_emoji_id(telegram, pane)
+        create_kwargs = {"icon_custom_emoji_id": topic_icon_id} if topic_icon_id else {}
+        topic_id = create_topic(chat_id, topic_name, **create_kwargs)
         counters["creates"] = counters.get("creates", 0) + 1
         entry["topic_id"] = topic_id
         entry["topic_name"] = topic_name
+        if topic_icon_id:
+            entry["topic_status_icon_key"] = topic_icon_key
+            entry["topic_status_icon_emoji"] = topic_icon_emoji
+            entry["topic_status_icon_custom_emoji_id"] = topic_icon_id
+            entry["topic_status_icon_updated_at"] = utc_now()
         entry["last_topic_verified_at"] = utc_now()
         entry.pop("topic_missing_at", None)
         entry.pop("topic_missing_id", None)
@@ -3803,9 +4031,26 @@ def sync_pane_once(
             clear_topic_mapping(entry, str(status_result.get("error") or status_result))
             save_state(state)
             return True
+    status_icon_ok = False
+    if STATUS_ICON_ENABLED and entry.get("topic_id"):
+        icon_result = update_topic_status_icon(chat_id, entry, pane, telegram=telegram)
+        if icon_result.get("attempted"):
+            counters["icon_updates"] = counters.get("icon_updates", 0) + 1
+        if result_topic_missing(icon_result):
+            clear_topic_mapping(entry, str(icon_result.get("error") or icon_result))
+            save_state(state)
+            return True
+        if icon_result.get("ok"):
+            status_icon_ok = True
+            if icon_result.get("attempted"):
+                changed = True
+            if STATUS_MARKER_SUPPRESS_WHEN_ICON_OK and clear_status_marker_for_icon(chat_id, entry):
+                changed = True
+
     if (
         STATUS_MARKER_ENABLED
         and not feed_delivered_this_pane
+        and not (STATUS_MARKER_SUPPRESS_WHEN_ICON_OK and status_icon_ok)
         and entry.get("topic_id")
         and counters.get("marker_sends", 0) < max_marker_sends
     ):
@@ -3893,7 +4138,15 @@ def sync_once() -> dict[str, Any]:
             telegram["last_preflight_error"] = error_text
             save_state(state)
             raise
-    counters = {"sends": sends, "creates": 0, "verifies": 0, "renames": 0, "feed_sends": 0, "marker_sends": 0}
+    counters = {
+        "sends": sends,
+        "creates": 0,
+        "verifies": 0,
+        "renames": 0,
+        "feed_sends": 0,
+        "marker_sends": 0,
+        "icon_updates": 0,
+    }
     caps = {
         "max_sends": MAX_SENDS_PER_RUN,
         "max_feed_sends": MAX_SENDS_PER_RUN,
@@ -3920,6 +4173,7 @@ def sync_once() -> dict[str, Any]:
         "sent": sends,
         "feed_sent": counters["feed_sends"],
         "marker_sent": counters["marker_sends"],
+        "icon_updated": counters["icon_updates"],
     }
 
 
@@ -4120,7 +4374,15 @@ def event_once() -> dict[str, Any]:
             "error": preflight_error,
         }
 
-    counters = {"sends": 0, "creates": 0, "verifies": 0, "renames": 0, "feed_sends": 0, "marker_sends": 0}
+    counters = {
+        "sends": 0,
+        "creates": 0,
+        "verifies": 0,
+        "renames": 0,
+        "feed_sends": 0,
+        "marker_sends": 0,
+        "icon_updates": 0,
+    }
     caps = {
         "max_sends": min(MAX_SENDS_PER_RUN, 2),
         "max_feed_sends": min(MAX_SENDS_PER_RUN, 2),
@@ -4140,7 +4402,7 @@ def event_once() -> dict[str, Any]:
             if counters.get("feed_sends", 0) > before_feed_sends:
                 break
             entry = (state.get("panes") or {}).get(pane_key(pane), {})
-            if TURN_FEED_ENABLED and entry.get("last_turn_available") is False:
+            if TURN_FEED_ENABLED and entry.get("last_turn_available") is False and not settle:
                 break
             if not settle or time.monotonic() >= deadline or counters.get("sends", 0) >= caps["max_sends"]:
                 break
@@ -4165,6 +4427,7 @@ def event_once() -> dict[str, Any]:
         "sent": counters["sends"],
         "feed_sent": counters["feed_sends"],
         "marker_sent": counters["marker_sends"],
+        "icon_updated": counters["icon_updates"],
         "attempts": attempts,
         "created": counters["creates"],
         "verified": counters["verifies"],

@@ -175,7 +175,40 @@ Fallback policy:
 - Transient/network error: do not resend, to avoid duplicate posts
 - Live-card edits retry naturally on the next timer tick
 
-## Topic Status Markers
+## Topic Status Icons And Markers
+
+Telegram bots cannot edit an existing forum topic's color directly, but they can edit the topic's `icon_custom_emoji_id`. Herdres can use that as the low-noise pane status surface:
+
+```text
+⚡️ working
+☕️ idle
+✅ done
+❗️ blocked/waiting
+‼️ error
+📈 workflow activity
+```
+
+Herdres first checks explicit `HERDR_TELEGRAM_TOPICS_STATUS_ICON_*` custom emoji IDs. If those are unset, it calls `getForumTopicIconStickers`, caches the returned forum-icon stickers, and matches them by the configured `*_EMOJI` values. The defaults above are chosen from Telegram's allowed forum topic icon set. Icon edits happen only when the pane status icon changes, so routine sync does not spend messages or LLM tokens on status display.
+
+Controls:
+
+```bash
+HERDR_TELEGRAM_TOPICS_STATUS_ICON=1
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_CACHE_TTL=86400
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_RETRY=300
+HERDR_TELEGRAM_TOPICS_STATUS_MARKER_SUPPRESS_WHEN_ICON_OK=1
+
+# Optional explicit Telegram custom emoji IDs for forum topic icons.
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING=
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE=
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE=
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED=
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR=
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW=
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN=
+```
+
+If Telegram does not offer a matching forum icon sticker, Herdres leaves the topic icon unchanged and can still use compact marker messages.
 
 Telegram does not move edited messages to the bottom of a topic. To keep each pane topic glanceable, Herdres can post a compact status marker as the latest message in the mapped topic:
 
@@ -359,6 +392,10 @@ HERDR_TELEGRAM_TOPICS_USER_PROMPT_MAX_CHARS=1200
 HERDR_TELEGRAM_TOPICS_RICH_MESSAGES=1
 HERDR_TELEGRAM_TOPICS_RICH_MAX_CHARS=14000
 HERDR_TELEGRAM_TOPICS_LIVE_CARD=1
+HERDR_TELEGRAM_TOPICS_STATUS_ICON=1
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_CACHE_TTL=86400
+HERDR_TELEGRAM_TOPICS_STATUS_ICON_RETRY=300
+HERDR_TELEGRAM_TOPICS_STATUS_MARKER_SUPPRESS_WHEN_ICON_OK=1
 HERDR_TELEGRAM_TOPICS_STATUS_MARKER=1
 HERDR_TELEGRAM_TOPICS_STATUS_MARKER_DELETE_OLD=1
 HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS=0
