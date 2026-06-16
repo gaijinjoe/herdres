@@ -101,7 +101,7 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
     "yes",
     "on",
 }
-RICH_RENDER_VERSION = 13
+RICH_RENDER_VERSION = 14
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
@@ -1114,8 +1114,98 @@ def safe_callback_data(action: str, prompt_id: str, choice_id: str) -> str:
     return f"herdr:{clean_action}:{clean_prompt}:{short_choice}"
 
 
+def normalize_pending_interaction(turn: dict[str, Any]) -> dict[str, Any] | None:
+    pending = turn.get("pending_interaction")
+    if not isinstance(pending, dict):
+        return None
+    interaction_id = sanitize_text(str(pending.get("interaction_id") or ""), 300).strip()
+    if not interaction_id:
+        return None
+    kind = str(pending.get("kind") or pending.get("type") or "").strip().lower()
+    kind = kind.replace("-", "_")
+    if kind not in {"single_question", "multi_question_form"}:
+        return None
+    revision = sanitize_text(str(pending.get("revision") or "1"), 40).strip() or "1"
+    raw_questions = pending.get("questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        return None
+
+    questions: list[dict[str, Any]] = []
+    for q_idx, raw_question in enumerate(raw_questions[:12], start=1):
+        if not isinstance(raw_question, dict):
+            return None
+        question_id = sanitize_text(str(raw_question.get("question_id") or raw_question.get("id") or f"q{q_idx}"), 80)
+        title = sanitize_text(
+            str(raw_question.get("title") or raw_question.get("prompt") or raw_question.get("question") or f"Question {q_idx}"),
+            500,
+        ).strip()
+        raw_options = raw_question.get("options")
+        if not question_id or not title or not isinstance(raw_options, list) or not raw_options:
+            return None
+        options: list[dict[str, str]] = []
+        for opt_idx, raw_option in enumerate(raw_options[:12], start=1):
+            if isinstance(raw_option, dict):
+                option_id = sanitize_text(
+                    str(raw_option.get("option_id") or raw_option.get("id") or raw_option.get("number") or opt_idx),
+                    80,
+                )
+                label = sanitize_text(
+                    str(raw_option.get("label") or raw_option.get("text") or raw_option.get("title") or option_id),
+                    180,
+                ).strip()
+                value = sanitize_text(str(raw_option.get("value") or raw_option.get("send_text") or option_id), 500)
+                description = sanitize_text(
+                    str(raw_option.get("description") or raw_option.get("detail") or raw_option.get("help") or ""),
+                    500,
+                ).strip()
+                needs_detail = (
+                    _boolish(raw_option.get("needs_detail"))
+                    or _boolish(raw_option.get("requires_detail"))
+                    or _boolish(raw_option.get("custom"))
+                    or not value.strip()
+                )
+            else:
+                option_id = sanitize_text(str(opt_idx), 80)
+                label = sanitize_text(str(raw_option or ""), 180).strip()
+                value = option_id
+                description = ""
+                needs_detail = False
+            if not option_id or not label:
+                return None
+            option: dict[str, str] = {
+                "option_id": option_id,
+                "label": label,
+                "value": value,
+            }
+            if description:
+                option["description"] = description
+            if needs_detail:
+                option["needs_detail"] = "1"
+            options.append(option)
+        questions.append(
+            {
+                "question_id": question_id,
+                "title": title,
+                "type": sanitize_text(str(raw_question.get("type") or "single_choice"), 80),
+                "required": "1" if _boolish(raw_question.get("required", True)) else "",
+                "options": options,
+            }
+        )
+
+    answers = pending.get("answers") if isinstance(pending.get("answers"), dict) else {}
+    return {
+        "interaction_id": interaction_id,
+        "revision": revision,
+        "kind": kind,
+        "prompt": sanitize_text(str(pending.get("prompt") or "Input needed."), 1200).strip() or "Input needed.",
+        "questions": questions,
+        "answers": answers,
+        "source": "pending_interaction",
+    }
+
+
 def normalize_pending_decision(turn: dict[str, Any]) -> dict[str, Any] | None:
-    if isinstance(turn.get("pending_interaction"), dict):
+    if normalize_pending_interaction(turn):
         return None
     pending = turn.get("pending_decision")
     if not isinstance(pending, dict):
@@ -1240,11 +1330,79 @@ def make_decision_feed_item(turn: dict[str, Any], decision: dict[str, Any]) -> d
     }
 
 
+def interaction_answer_text(question: dict[str, Any], answer: Any) -> str:
+    if not isinstance(answer, dict):
+        return sanitize_text(str(answer or ""), 500).strip()
+    text = sanitize_text(str(answer.get("text") or answer.get("value") or ""), 500).strip()
+    option_id = str(answer.get("option_id") or answer.get("id") or "").strip()
+    if option_id:
+        for option in list(question.get("options") or []):
+            if str(option.get("option_id") or "") == option_id:
+                label = str(option.get("label") or option_id).strip()
+                return f"{label}: {text}" if text else label
+        return f"{option_id}: {text}" if text else option_id
+    return text
+
+
+def make_interaction_feed_item(turn: dict[str, Any], interaction: dict[str, Any]) -> dict[str, Any] | None:
+    questions = list(interaction.get("questions") or [])
+    if not questions:
+        return None
+    user_text = sanitize_text(str(turn.get("user_text") or ""), USER_PROMPT_MAX_CHARS).strip()
+    assistant_context = sanitize_text(str(turn.get("assistant_final_text") or ""), FINAL_REPLY_MAX_CHARS).strip()
+    prompt = sanitize_text(str(interaction.get("prompt") or "Input needed."), 1200).strip()
+    answers = interaction.get("answers") if isinstance(interaction.get("answers"), dict) else {}
+    note = "Read-only structured prompt. Answer in Herdr until semantic interaction submit is available."
+    text_parts: list[str] = []
+    if user_text:
+        text_parts.extend(["You asked", user_text, ""])
+    if assistant_context:
+        text_parts.extend([assistant_context, ""])
+    text_parts.append(prompt)
+    text_parts.append("")
+    for idx, question in enumerate(questions, start=1):
+        title = str(question.get("title") or f"Question {idx}").strip()
+        text_parts.append(f"{idx}. {title}")
+        answer_text = interaction_answer_text(question, answers.get(str(question.get("question_id") or "")))
+        if answer_text:
+            text_parts.append(f"Answer: {answer_text}")
+        for option in list(question.get("options") or []):
+            label = str(option.get("label") or "").strip()
+            option_id = str(option.get("option_id") or "").strip()
+            description = str(option.get("description") or "").strip()
+            line = f"- {option_id}. {label}" if option_id else f"- {label}"
+            if description:
+                line = f"{line}: {description}"
+            text_parts.append(line)
+        text_parts.append("")
+    text_parts.append(note)
+    return {
+        "kind": "interaction_readonly",
+        "title": "Input needed",
+        "summary": prompt,
+        "detail": note,
+        "lines": [],
+        "text": "\n".join(text_parts).strip(),
+        "turn_id": sanitize_text(str(turn.get("turn_id") or ""), 300),
+        "interaction_id": str(interaction.get("interaction_id") or ""),
+        "interaction_revision": str(interaction.get("revision") or "1"),
+        "choice_source": "pending_interaction",
+        "user_text": user_text,
+        "assistant_final_text": assistant_context,
+        "questions": questions,
+        "answers": answers,
+        "notify": True,
+    }
+
+
 def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(turn, dict):
         return None
     if turn.get("available") is not True:
         return None
+    interaction = normalize_pending_interaction(turn) if STRUCTURED_INTERACTIONS_ENABLED else None
+    if interaction and (turn.get("awaiting_input") is True or turn.get("complete") is not True):
+        return make_interaction_feed_item(turn, interaction)
     decision = normalize_pending_decision(turn) if STRUCTURED_INTERACTIONS_ENABLED else None
     if decision and (turn.get("awaiting_input") is True or turn.get("complete") is not True):
         return make_decision_feed_item(turn, decision)
@@ -2407,12 +2565,67 @@ def render_decision_item_html(item: dict[str, Any]) -> str:
     return rendered
 
 
+def render_interaction_readonly_item_html(item: dict[str, Any]) -> str:
+    user_text = str(item.get("user_text") or "").strip()
+    assistant_context = str(item.get("assistant_final_text") or "").strip()
+    prompt = str(item.get("summary") or "Input needed.").strip()
+    questions = list(item.get("questions") or [])
+    answers = item.get("answers") if isinstance(item.get("answers"), dict) else {}
+    parts: list[str] = []
+    if user_text:
+        parts.append(
+            "<blockquote>"
+            "<b>You asked</b><br>"
+            f"{_blockquote_text(user_text, USER_PROMPT_MAX_CHARS)}"
+            "</blockquote>"
+        )
+    if assistant_context:
+        context_html = render_final_reply_html(assistant_context)
+        if context_html:
+            parts.append(context_html)
+    parts.append("<h3>Input needed</h3>")
+    if prompt:
+        parts.append(_rich_paragraph(prompt))
+    for idx, question in enumerate(questions, start=1):
+        title = str(question.get("title") or f"Question {idx}").strip()
+        parts.append(f"<h4>{idx}. {_rich_inline(title, 180)}</h4>")
+        answer = interaction_answer_text(question, answers.get(str(question.get("question_id") or "")))
+        if answer:
+            parts.append(f"<p><b>Current answer:</b> {_rich_inline(answer, 500)}</p>")
+        option_items: list[str] = []
+        for option in list(question.get("options") or []):
+            option_id = str(option.get("option_id") or "").strip()
+            label = str(option.get("label") or "").strip()
+            description = str(option.get("description") or "").strip()
+            prefix = f"{option_id}. " if option_id else ""
+            body = _rich_inline(f"{prefix}{label}", 240)
+            if description:
+                body += f"<br><small>{_rich_inline(description, 500)}</small>"
+            option_items.append(f"<li>{body}</li>")
+        if option_items:
+            parts.append("<ul>\n" + "\n".join(option_items) + "\n</ul>")
+    parts.append(
+        "<p><small>"
+        "Read-only structured prompt. Answer in Herdr until semantic interaction submit is available."
+        "</small></p>"
+    )
+    rendered = "\n".join(part for part in parts if part).strip()
+    if len(rendered) > MAX_RICH_HTML_CHARS:
+        compact = dict(item)
+        compact["assistant_final_text"] = ""
+        compact["questions"] = questions[:4]
+        return render_interaction_readonly_item_html(compact)
+    return rendered
+
+
 def render_feed_item_html(item: dict[str, Any], *, live: bool = False) -> str:
     kind = str(item.get("kind") or "update").lower()
     if kind == "turn":
         return render_turn_item_html(item)
     if kind == "decision":
         return render_decision_item_html(item)
+    if kind == "interaction_readonly":
+        return render_interaction_readonly_item_html(item)
     title = str(item.get("title") or "").strip()
     if not title:
         title = {
@@ -2753,8 +2966,12 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
         "options": item.get("options") or [],
         "turn_id": item.get("turn_id"),
         "decision_id": item.get("decision_id"),
+        "interaction_id": item.get("interaction_id"),
+        "interaction_revision": item.get("interaction_revision"),
         "user_text": item.get("user_text"),
         "assistant_final_text": item.get("assistant_final_text"),
+        "questions": item.get("questions") or [],
+        "answers": item.get("answers") or {},
     }
     if include_render_version:
         payload["render_version"] = RICH_RENDER_VERSION

@@ -2497,7 +2497,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         self.assertIsNone(item)
 
-    def test_pending_decision_rejects_when_pending_interaction_present(self) -> None:
+    def test_valid_pending_interaction_wins_over_pending_decision(self) -> None:
         turn = {
             "available": True,
             "complete": False,
@@ -2507,7 +2507,13 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                 "interaction_id": "turn-1:interaction",
                 "kind": "multi_question_form",
                 "revision": 1,
-                "questions": [],
+                "questions": [
+                    {
+                        "question_id": "q1",
+                        "title": "First question",
+                        "options": [{"option_id": "1", "label": "One", "value": "1"}],
+                    }
+                ],
             },
             "pending_decision": {
                 "decision_id": "turn-1:decision",
@@ -2518,7 +2524,167 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 
         item = herdres.make_turn_feed_item(turn)
 
-        self.assertIsNone(item)
+        self.assertEqual(item["kind"], "interaction_readonly")
+        self.assertEqual(item["interaction_id"], "turn-1:interaction")
+
+    def test_pending_interaction_renders_readonly_questions_and_descriptions(self) -> None:
+        item = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": False,
+                "awaiting_input": True,
+                "turn_id": "turn-1",
+                "user_text": "Review the plan.",
+                "pending_interaction": {
+                    "interaction_id": "turn-1:interaction",
+                    "revision": 2,
+                    "kind": "multi_question_form",
+                    "prompt": "Answer setup questions before implementation.",
+                    "questions": [
+                        {
+                            "question_id": "q1",
+                            "title": "Register/tone vs length",
+                            "options": [
+                                {
+                                    "option_id": "1",
+                                    "label": "Mostly register/tone",
+                                    "description": "The objection is the teacher-like explainer voice.",
+                                    "value": "1",
+                                },
+                                {
+                                    "option_id": "2",
+                                    "label": "Mostly length",
+                                    "description": "The objection is that the reply is too long.",
+                                    "value": "2",
+                                },
+                            ],
+                        }
+                    ],
+                    "answers": {"q1": {"option_id": "1"}},
+                },
+            }
+        )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "interaction_readonly")
+        self.assertEqual(item["interaction_revision"], "2")
+        self.assertEqual(item["questions"][0]["options"][0]["description"], "The objection is the teacher-like explainer voice.")
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("<h3>Input needed</h3>", html)
+        self.assertIn("Register/tone vs length", html)
+        self.assertIn("Mostly register/tone", html)
+        self.assertIn("teacher-like explainer voice", html)
+        self.assertIn("Current answer", html)
+        self.assertIn("Read-only structured prompt", html)
+        markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
+        self.assertIsNone(markup)
+        self.assertIsNone(active_prompt)
+        self.assertTrue(clear_prompt)
+
+    def test_malformed_pending_interaction_falls_through_to_valid_pending_decision(self) -> None:
+        item = herdres.make_turn_feed_item(
+            {
+                "available": True,
+                "complete": False,
+                "awaiting_input": True,
+                "turn_id": "turn-1",
+                "pending_interaction": {
+                    "interaction_id": "turn-1:interaction",
+                    "kind": "multi_question_form",
+                    "revision": 1,
+                    "questions": [],
+                },
+                "pending_decision": {
+                    "decision_id": "turn-1:decision",
+                    "prompt": "Use the fallback decision?",
+                    "options": [{"id": "1", "label": "Use decision", "send_text": "1"}],
+                },
+            }
+        )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "decision")
+        self.assertEqual(item["decision_id"], "turn-1:decision")
+
+    def test_sync_turn_feed_sends_pending_interaction_readonly_without_buttons(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "blocked",
+        }
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "active_prompt": test_active_prompt({
+                "id": "decision1",
+                "choice_source": "pending_decision",
+                "options": [{"number": "1", "label": "Old", "send_text": "1"}],
+            }),
+            "awaiting_detail": {
+                "user_id": "42",
+                "prompt_id": "decision1",
+                "choice": "1",
+                "created_at": herdres.utc_now(),
+            },
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        pane_turn = Mock(
+            return_value={
+                "available": True,
+                "complete": False,
+                "awaiting_input": True,
+                "turn_id": "turn-2",
+                "pending_interaction": {
+                    "interaction_id": "turn-2:interaction",
+                    "revision": 1,
+                    "kind": "multi_question_form",
+                    "prompt": "Answer setup questions.",
+                    "questions": [
+                        {
+                            "question_id": "q1",
+                            "title": "Build plan",
+                            "options": [
+                                {"option_id": "1", "label": "Build now", "description": "Implement both phases."}
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1001"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=pane_turn,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertEqual(result["feed_sent"], 1)
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["kind"], "interaction_readonly")
+        self.assertIsNone(send_feed_item.call_args.kwargs["reply_markup"])
+        self.assertNotIn("active_prompt", entry)
+        self.assertNotIn("awaiting_detail", entry)
 
     def test_prompt_delivery_blocks_pending_decision_when_structured_disabled(self) -> None:
         item = {
