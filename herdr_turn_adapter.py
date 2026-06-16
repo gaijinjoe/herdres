@@ -191,18 +191,67 @@ def pane_recent_text(pane_id: str) -> str:
     return ""
 
 
+def claude_sibling_count(pane: dict[str, Any]) -> int:
+    """Number of claude panes sharing this pane's foreground cwd (including it).
+
+    1 means this pane is the only claude session in its cwd, so the newest
+    session file in that project dir is unambiguously this pane's — no need to
+    scrape/match the visible pane. On any uncertainty we return 2 so the caller
+    falls back to visible-text disambiguation.
+    """
+    cwd = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+    if not cwd:
+        return 2
+    try:
+        data = run_real_herdr_json(["pane", "list"])
+    except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired, OSError):
+        return 2
+    panes = data.get("result", {}).get("panes")
+    if not isinstance(panes, list):
+        return 2
+    count = 0
+    for other in panes:
+        if (
+            isinstance(other, dict)
+            and str(other.get("agent") or "").lower() == "claude"
+            and str(other.get("foreground_cwd") or other.get("cwd") or "") == cwd
+        ):
+            count += 1
+    return count or 1
+
+
 def infer_claude_turn_from_visible_pane(pane: dict[str, Any], pane_id: str) -> dict[str, Any]:
-    pane_text = pane_recent_text(pane_id)
-    if not pane_text.strip():
-        return unavailable("claude_pane_text_unavailable", pane_id=pane_id, agent="claude")
-    matches: list[tuple[int, float, Path, dict[str, Any]]] = []
+    candidates: list[tuple[float, Path, dict[str, Any]]] = []
     for path in claude_candidate_paths_for_pane(pane):
         turn = extract_claude_turn(path, pane_id, path.stem)
         if turn.get("complete") is not True or not turn.get("assistant_final_text"):
             continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((mtime, path, turn))
+    if not candidates:
+        return unavailable("no_completed_claude_turn", pane_id=pane_id, agent="claude")
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    if claude_sibling_count(pane) <= 1:
+        # Only one claude session in this cwd: the most recently written session
+        # file is this pane's. Reliable and avoids the slow/fragile pane scrape.
+        _mtime, path, turn = candidates[0]
+        turn["agent_session_id"] = path.stem
+        turn["session_match_source"] = "exclusive_cwd_mtime"
+        return result_turn(turn)
+
+    # Shared cwd: disambiguate by matching the visible pane against each session.
+    pane_text = pane_recent_text(pane_id)
+    if not pane_text.strip():
+        return unavailable("claude_pane_text_unavailable", pane_id=pane_id, agent="claude")
+    matches: list[tuple[int, float, Path, dict[str, Any]]] = []
+    for mtime, path, turn in candidates:
         score = turn_visible_match_score(turn, pane_text)
         if score:
-            matches.append((score, path.stat().st_mtime, path, turn))
+            matches.append((score, mtime, path, turn))
     matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
     if not matches or matches[0][0] < 2:
         return unavailable("no_unique_claude_session_match", pane_id=pane_id, agent="claude")

@@ -305,7 +305,7 @@ class TurnAdapterTests(unittest.TestCase):
                 adapter,
                 "pane_recent_text",
                 Mock(return_value="prefix " + final + " suffix"),
-            ):
+            ), patch.object(adapter, "claude_sibling_count", Mock(return_value=2)):
                 result = adapter.pane_turn("pane-1")
 
         turn = result["result"]["turn"]
@@ -351,12 +351,44 @@ class TurnAdapterTests(unittest.TestCase):
                 adapter,
                 "pane_recent_text",
                 Mock(return_value=final),
-            ):
+            ), patch.object(adapter, "claude_sibling_count", Mock(return_value=2)):
                 result = adapter.pane_turn("pane-1")
 
         turn = result["result"]["turn"]
         self.assertFalse(turn["available"])
         self.assertEqual(turn["reason"], "ambiguous_claude_session_match")
+
+    def test_claude_exclusive_cwd_uses_newest_session_without_visible_match(self) -> None:
+        # When this pane is the only claude session in its cwd, use the newest
+        # session file directly even if the (tool-heavy) visible pane doesn't match.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "-tmp-project"
+            project.mkdir()
+            final = "Deployed and verified; all tests green."
+            old = project / "session-old.jsonl"
+            new = project / "session-new.jsonl"
+            for path, txt, uu in ((old, "Old answer.", "ao"), (new, final, "an")):
+                write_jsonl(path, [
+                    {"type": "user", "uuid": "u" + uu, "message": {"content": "go"}},
+                    {"type": "assistant", "uuid": uu, "timestamp": "now",
+                     "message": {"stop_reason": "end_turn", "content": [{"text": txt}]}},
+                ])
+            adapter.os.utime(old, (1, 1))  # make 'new' clearly the most recently written
+            pane = {"pane_id": "pane-1", "agent": "claude", "cwd": "/tmp/project",
+                    "foreground_cwd": "/tmp/project", "agent_session": None}
+            with patch.object(adapter, "pane_from_list", Mock(return_value=pane)), patch.dict(
+                adapter.os.environ, {"CLAUDE_PROJECTS_DIR": str(root)},
+            ), patch.object(adapter, "claude_sibling_count", Mock(return_value=1)), patch.object(
+                adapter, "pane_recent_text", Mock(return_value="unrelated tool output noise"),
+            ):
+                result = adapter.pane_turn("pane-1")
+
+        turn = result["result"]["turn"]
+        self.assertTrue(turn["available"])
+        self.assertEqual(turn["agent_session_id"], "session-new")
+        self.assertEqual(turn["session_match_source"], "exclusive_cwd_mtime")
+        self.assertEqual(turn["assistant_final_text"], final)
 
     def test_codex_pane_turn_requires_agent_session_id(self) -> None:
         with patch.object(
