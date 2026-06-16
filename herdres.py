@@ -2316,9 +2316,9 @@ def _is_turn_heading_line(
         return True
     if clean.endswith(":"):
         return True
-    if first_block and next_nonempty and len(words) <= 4 and clean[:1].isupper() and not clean.endswith(("!", "?")):
+    if first_block and next_nonempty and len(words) <= 4 and clean[:1].isupper() and not clean.endswith(("!", "?")) and not (len(words) > 1 and clean.endswith(".")):
         return True
-    if previous_blank and next_nonempty and len(words) <= 4 and clean[:1].isupper() and not clean.endswith(("!", "?")):
+    if previous_blank and next_nonempty and len(words) <= 4 and clean[:1].isupper() and not clean.endswith(("!", "?")) and not (len(words) > 1 and clean.endswith(".")):
         return True
     return False
 
@@ -2464,14 +2464,13 @@ def _render_text_fence(code_lines: list[str]) -> str:
     return "<br><br>".join(blocks)
 
 
-_BLOCK_CLOSE_RE = re.compile(r"</(?:p|h[1-6]|ul|ol|blockquote|details|table)>$")
-
-
 def _join_blocks(parts: list[str]) -> str:
-    # Join top-level blocks with one blank line of separation, accounting for how
-    # much trailing space each block type already has: <pre> code blocks carry
-    # their own margin (add nothing), block tags need one <br>, bare text/lines
-    # need two <br> to show a blank line.
+    # One blank line between blocks, sized to each block's own trailing space:
+    #   - a <pre> code block carries its own margin -> add nothing;
+    #   - a block that ends in a closing tag (</p>, </h3>, </b>, </ul>, </code>...)
+    #     already breaks to the next line -> one <br> gives a blank line;
+    #   - a block ending in plain text (e.g. a text-fenced list) has no trailing
+    #     break -> two <br> to show a blank line.
     kept = [p for p in parts if p and p.strip()]
     if not kept:
         return ""
@@ -2480,7 +2479,7 @@ def _join_blocks(parts: list[str]) -> str:
         prev = result.rstrip()
         if prev.endswith("</pre>"):
             sep = ""
-        elif _BLOCK_CLOSE_RE.search(prev):
+        elif prev.endswith(">"):
             sep = "<br>"
         else:
             sep = "<br><br>"
