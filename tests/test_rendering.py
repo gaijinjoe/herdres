@@ -1811,7 +1811,12 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
             "Both, equally",
             "Type something.",
         ])
+        self.assertIn("teacher/analyst voice", item["options"][0]["description"])
+        self.assertIn("word count", item["options"][1]["description"])
         self.assertIn("Which is it?", item["summary"])
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("<small>", html)
+        self.assertIn("teacher/analyst voice", html)
 
     def test_visible_choice_fallback_extracts_current_pane_prompt(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
@@ -1836,6 +1841,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel
         self.assertEqual(item["decision_id"], item["prompt_id"])
         self.assertEqual(item["turn_id"], f"visible-choice:{item['prompt_id']}")
         self.assertEqual(len(item["options"]), 4)
+        self.assertIn("short explainer", item["options"][0]["description"])
 
     def test_decision_buttons_can_send_explicit_text(self) -> None:
         item = herdres.make_turn_feed_item(

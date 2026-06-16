@@ -1697,7 +1697,7 @@ def _rich_lines_block(value: str, *, max_chars: int = MAX_RICH_DETAIL_CHARS) -> 
 def _rich_options_block(options: list[dict[str, str]]) -> str:
     if not options:
         return ""
-    numbered: list[tuple[int, str]] = []
+    numbered: list[tuple[int, str, str]] = []
     sequential = True
     for idx, opt in enumerate(options[:12], start=1):
         raw_number = str(opt.get("number") or idx)
@@ -1708,11 +1708,20 @@ def _rich_options_block(options: list[dict[str, str]]) -> str:
             number = idx
         if number != idx:
             sequential = False
-        numbered.append((number, str(opt.get("label") or "")))
+        numbered.append((number, str(opt.get("label") or ""), str(opt.get("description") or "")))
     if sequential:
-        items = "\n".join(f"<li>{_html_text(label, 180)}</li>" for _, label in numbered)
+        rendered_items: list[str] = []
+        for _number, label, description in numbered:
+            body = _html_text(label, 180)
+            if description.strip():
+                body += f"<br><small>{_rich_inline(description, 500)}</small>"
+            rendered_items.append(f"<li>{body}</li>")
+        items = "\n".join(rendered_items)
         return f"<ol>\n{items}\n</ol>"
-    return "\n".join(_rich_paragraph(f"{number}) {label}") for number, label in numbered)
+    return "\n".join(
+        _rich_paragraph(f"{number}) {label}" + (f"\n{description}" if description else ""))
+        for number, label, description in numbered
+    )
 
 
 def line_is_question_heading(line: str) -> bool:
@@ -2308,20 +2317,36 @@ def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, An
         start = idx
         options: list[dict[str, str]] = []
         seen = set()
+        current_option: dict[str, str] | None = None
+        continuation_lines: list[str] = []
+
+        def flush_continuation() -> None:
+            nonlocal continuation_lines, current_option
+            if current_option is not None and continuation_lines:
+                current_option["description"] = sanitize_text(
+                    re.sub(r"\s+", " ", " ".join(line.strip() for line in continuation_lines)).strip(),
+                    700,
+                )
+            continuation_lines = []
+
         while idx < len(lines):
             item = option_match(lines[idx])
             if not item:
                 if options and choice_continuation_line(lines[idx]):
+                    continuation_lines.append(lines[idx])
                     idx += 1
                     continue
                 break
+            flush_continuation()
             number = item.group(1)
             label = sanitize_text(item.group(2).strip(), 120)
             if number in seen or not label:
                 break
             seen.add(number)
-            options.append({"number": number, "label": label})
+            current_option = {"number": number, "label": label}
+            options.append(current_option)
             idx += 1
+        flush_continuation()
         if 2 <= len(options) <= 12:
             best = (start, idx, options)
         idx += 1
@@ -2336,7 +2361,12 @@ def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, An
     if not explicit and not has_choice_context(context):
         return None
     question = compact_block(context, max_lines=3, max_chars=500) or "Choose a response."
-    body = "\n".join(f"{opt['number']}) {opt['label']}" for opt in options)
+    body_lines: list[str] = []
+    for opt in options:
+        body_lines.append(f"{opt['number']}) {opt['label']}")
+        if opt.get("description"):
+            body_lines.append(f"   {opt['description']}")
+    body = "\n".join(body_lines)
     text = f"Question\n{question}\n\n{body}"
     prompt_id = prompt_id_for(text, options)
     return {
