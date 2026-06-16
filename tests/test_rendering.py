@@ -1785,6 +1785,58 @@ What changed:
         self.assertEqual(rows[-1][0]["text"], "Tell me differently")
         self.assertEqual(rows[-1][0]["callback_data"], "herdr:d:abc123:custom")
 
+    def test_extract_choices_skips_descriptions_between_options(self) -> None:
+        raw = """Which is it? This picks the fix lever.
+
+❯ 1. Mostly register/tone
+     The teacher/analyst voice is the problem.
+  2. Mostly length
+     It's the word count making the account look AI.
+  3. Both, equally
+     Long AND explainer-register both signal AI.
+  4. Type something.
+─────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"""
+
+        item = herdres.extract_choices(herdres.clean_feed_lines(raw))
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual([opt["label"] for opt in item["options"]], [
+            "Mostly register/tone",
+            "Mostly length",
+            "Both, equally",
+            "Type something.",
+        ])
+        self.assertIn("Which is it?", item["summary"])
+
+    def test_visible_choice_fallback_extracts_current_pane_prompt(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        raw = """Codex thinks your real objection is register, not raw word count. Which is it?
+
+❯ 1. Mostly register/tone
+     A short explainer is still bad.
+  2. Mostly length
+     You want shorter by default.
+  3. Both, equally
+     Length and register both matter.
+  4. Type something.
+"""
+
+        with patch.object(herdres, "pane_output", Mock(return_value=raw)):
+            item = herdres.extract_visible_choice_feed_item(pane)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "choices")
+        self.assertEqual(item["title"], "Decision needed")
+        self.assertEqual(item["decision_id"], item["prompt_id"])
+        self.assertEqual(item["turn_id"], f"visible-choice:{item['prompt_id']}")
+        self.assertEqual(len(item["options"]), 4)
+
     def test_decision_buttons_can_send_explicit_text(self) -> None:
         item = herdres.make_turn_feed_item(
             {
@@ -2445,6 +2497,58 @@ Verification
         reply_markup = send_feed_item.call_args.kwargs["reply_markup"]
         self.assertEqual(reply_markup["inline_keyboard"][1][0]["callback_data"], f"herdr:c:{sent_item['prompt_id']}:full")
         self.assertIn("Which path should I take?", entry["last_clean_text"])
+
+    def test_sync_turn_feed_falls_back_to_visible_choice_prompt(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "claude",
+            "agent_status": "idle",
+        }
+        key = herdres.pane_key(pane)
+        entry = {"pane_key": key, "pane_id": "pane-1", "topic_id": "77"}
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        raw = """Codex thinks your real objection is register, not raw word count. Which is it?
+
+❯ 1. Mostly register/tone
+     A short explainer is still bad.
+  2. Mostly length
+     You want shorter by default.
+  3. Both, equally
+     Length and register both matter.
+  4. Type something.
+"""
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1002"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_unique_claude_session_match"}),
+            pane_output=Mock(return_value=raw),
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertEqual(result["feed_sent"], 1)
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["kind"], "choices")
+        self.assertEqual(sent_item["title"], "Decision needed")
+        self.assertEqual(len(sent_item["options"]), 4)
+        self.assertEqual(entry["last_clean_kind"], "choices")
+        self.assertIn("active_prompt", entry)
 
     def test_report_command_turn_feed_uses_pane_turn_not_legacy_parser(self) -> None:
         pane = {

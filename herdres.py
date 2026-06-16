@@ -814,6 +814,17 @@ def option_match(line: str) -> re.Match[str] | None:
     return re.match(r"^\s*(?:[\u276f>*-]\s*)?(\d{1,2})[.)]\s+(.{1,180})$", line)
 
 
+def choice_continuation_line(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    if option_match(stripped):
+        return False
+    if stripped.startswith(("─", "━", "Enter to select", "Tab/", "Esc to cancel", "←", "→")):
+        return False
+    return True
+
+
 def prompt_id_for(text: str, options: list[dict[str, str]]) -> str:
     payload = json.dumps({"text": text, "options": options}, sort_keys=True)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
@@ -1163,6 +1174,24 @@ def make_turn_feed_item(turn: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def extract_visible_choice_feed_item(pane: dict[str, Any]) -> dict[str, Any] | None:
+    pane_id = str(pane.get("pane_id") or "")
+    if not pane_id:
+        return None
+    raw = pane_output(pane_id, lines=READ_LINES_COMMAND_MAX, max_chars=FEED_MAX_CHARS, source="visible")
+    if not raw.strip():
+        return None
+    item = extract_choices(clean_feed_lines(raw))
+    if not item:
+        return None
+    prompt_id = str(item.get("prompt_id") or "")
+    if prompt_id:
+        item["turn_id"] = f"visible-choice:{prompt_id}"
+        item["decision_id"] = prompt_id
+    item["title"] = "Decision needed"
+    return item
+
+
 def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
     turn = pane_turn(str(pane.get("pane_id") or ""))
     available = bool(turn.get("available", True))
@@ -1174,6 +1203,8 @@ def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[
         else:
             entry.pop("last_turn_reason", None)
     item = make_turn_feed_item(turn)
+    if not item:
+        item = extract_visible_choice_feed_item(pane)
     if item:
         entry["last_turn_id"] = item.get("turn_id") or ""
     return item
@@ -2245,7 +2276,7 @@ def choice_context_lines(lines: list[str], start: int) -> list[str]:
         if (
             line_is_question_heading(line)
             or contains_marker(low, QUESTION_MARKERS)
-            or re.search(r"\b(choose|select|pick|approve|which option)\b", low)
+            or re.search(r"\b(choose|select|pick|approve|which (?:is it|one|path|option))\b", low)
             or is_action_question([line])
         ):
             context.append(line)
@@ -2257,10 +2288,11 @@ def choice_context_lines(lines: list[str], start: int) -> list[str]:
 def has_choice_context(lines: list[str]) -> bool:
     text = compact_block(lines, max_lines=5, max_chars=700)
     low = text.lower()
+    flat = re.sub(r"\s+", " ", low)
     return (
         any(line_is_question_heading(line) for line in lines)
         or contains_marker(low, QUESTION_MARKERS)
-        or bool(re.search(r"\b(choose|select|pick|approve|which option)\b", low))
+        or bool(re.search(r"\b(choose|select|pick|approve|which (?:is it|one|path|option))\b", flat))
         or is_action_question(lines)
     )
 
@@ -2279,6 +2311,9 @@ def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, An
         while idx < len(lines):
             item = option_match(lines[idx])
             if not item:
+                if options and choice_continuation_line(lines[idx]):
+                    idx += 1
+                    continue
                 break
             number = item.group(1)
             label = sanitize_text(item.group(2).strip(), 120)
@@ -2294,6 +2329,10 @@ def extract_choices(lines: list[str], *, explicit: bool = False) -> dict[str, An
         return None
     start, end, options = best
     context = choice_context_lines(lines, start)
+    if not context:
+        nearby_context = lines[max(0, start - 8):start]
+        if has_choice_context(nearby_context):
+            context = nearby_context
     if not explicit and not has_choice_context(context):
         return None
     question = compact_block(context, max_lines=3, max_chars=500) or "Choose a response."
