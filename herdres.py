@@ -1297,6 +1297,74 @@ def extract_visible_choice_feed_item(pane: dict[str, Any]) -> dict[str, Any] | N
     return item
 
 
+def visible_readonly_prompt_note() -> str:
+    return (
+        "Visible-screen prompt only. Telegram buttons are disabled for safety. "
+        "Answer in Herdr directly; use /send only for simple text replies."
+    )
+
+
+def mark_visible_prompt_readonly(item: dict[str, Any]) -> dict[str, Any]:
+    readonly = dict(item)
+    prompt_id = str(readonly.get("prompt_id") or prompt_id_for(item_plain_text(readonly), list(readonly.get("options") or [])))
+    readonly["prompt_id"] = prompt_id
+    readonly["turn_id"] = f"visible-readonly:{prompt_id}"
+    readonly["choice_source"] = "visible_readonly"
+    readonly["title"] = "Input needed"
+    readonly["notify"] = True
+    readonly.pop("decision_id", None)
+    note = visible_readonly_prompt_note()
+    detail = str(readonly.get("detail") or "").strip()
+    if note not in detail:
+        readonly["detail"] = f"{detail}\n\n{note}".strip() if detail else note
+    text = str(readonly.get("text") or "").strip()
+    if text and note not in text:
+        readonly["text"] = f"{text}\n\n{note}"
+    return readonly
+
+
+def visible_action_question_text(lines: list[str]) -> str:
+    semantic_lines = [strip_assistant_reply_marker(line).strip() for line in lines if str(line or "").strip()]
+    search_from = max(0, len(semantic_lines) - 10)
+    for idx in range(len(semantic_lines) - 1, search_from - 1, -1):
+        current = semantic_lines[idx]
+        if "?" in current and ACTION_QUESTION_RE.search(current):
+            return sanitize_text(current, 700)
+        window_lines = semantic_lines[max(search_from, idx - 2):idx + 1]
+        window = compact_block(window_lines, max_lines=3, max_chars=700)
+        if "?" in window and ACTION_QUESTION_RE.search(window):
+            return window
+    tail = compact_block(semantic_lines[-6:], max_lines=6, max_chars=800)
+    return tail if "?" in tail and ACTION_QUESTION_RE.search(tail) else ""
+
+
+def extract_visible_readonly_question_item(pane: dict[str, Any]) -> dict[str, Any] | None:
+    pane_id = str(pane.get("pane_id") or "")
+    if not pane_id:
+        return None
+    raw = pane_output(pane_id, lines=READ_LINES_COMMAND_MAX, max_chars=FEED_MAX_CHARS, source="visible")
+    if not raw.strip():
+        return None
+    lines = clean_feed_lines(raw)
+    if not lines or not is_action_question(lines):
+        return None
+    question = visible_action_question_text(lines)
+    if not question:
+        return None
+    note = visible_readonly_prompt_note()
+    item = make_feed_item("question", "Input needed", f"{question}\n\n{note}", notify=True)
+    item["choice_source"] = "visible_readonly"
+    item["turn_id"] = f"visible-readonly-question:{hashlib.sha256(question.encode('utf-8')).hexdigest()[:16]}"
+    return item
+
+
+def extract_visible_readonly_feed_item(pane: dict[str, Any]) -> dict[str, Any] | None:
+    item = extract_visible_choice_feed_item(pane)
+    if item:
+        return mark_visible_prompt_readonly(item)
+    return extract_visible_readonly_question_item(pane)
+
+
 def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
     turn = pane_turn(str(pane.get("pane_id") or ""))
     available = bool(turn.get("available", True))
@@ -1308,8 +1376,11 @@ def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[
         else:
             entry.pop("last_turn_reason", None)
     item = make_turn_feed_item(turn)
-    if not item and VISIBLE_CHOICE_BUTTONS_ENABLED:
-        item = extract_visible_choice_feed_item(pane)
+    if not item:
+        if VISIBLE_CHOICE_BUTTONS_ENABLED:
+            item = extract_visible_choice_feed_item(pane)
+        else:
+            item = extract_visible_readonly_feed_item(pane)
     if item:
         entry["last_turn_id"] = item.get("turn_id") or ""
     return item
@@ -2804,6 +2875,8 @@ def prompt_source(item_or_prompt: dict[str, Any]) -> str:
     if source:
         return source
     turn_id = str(item_or_prompt.get("turn_id") or item.get("turn_id") or "")
+    if turn_id.startswith("visible-readonly:") or turn_id.startswith("visible-readonly-question:"):
+        return "visible_readonly"
     if turn_id.startswith("visible-choice:"):
         return "visible_scrape"
     if item_or_prompt.get("decision_id") or item.get("decision_id"):
@@ -2812,7 +2885,10 @@ def prompt_source(item_or_prompt: dict[str, Any]) -> str:
 
 
 def visible_choice_prompt_blocked(item_or_prompt: dict[str, Any]) -> bool:
-    return prompt_source(item_or_prompt) in {"visible_scrape", "legacy_clean_feed"} and not VISIBLE_CHOICE_BUTTONS_ENABLED
+    source = prompt_source(item_or_prompt)
+    if source == "visible_readonly":
+        return True
+    return source in {"visible_scrape", "legacy_clean_feed"} and not VISIBLE_CHOICE_BUTTONS_ENABLED
 
 
 def choices_reply_markup(prompt_id: str, options: list[dict[str, str]]) -> dict[str, Any]:
@@ -2844,6 +2920,8 @@ def prompt_delivery_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     if str(item.get("kind") or "").lower() not in {"choices", "decision"}:
         return None, None, True
     source = prompt_source(item)
+    if source == "visible_readonly":
+        return None, None, True
     if source in {"visible_scrape", "legacy_clean_feed"} and not VISIBLE_CHOICE_BUTTONS_ENABLED:
         return None, None, True
     if source == "legacy_clean_feed" and not LEGACY_CHOICES_ENABLED:

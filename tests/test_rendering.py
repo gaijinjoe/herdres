@@ -2099,6 +2099,25 @@ What changed:
         self.assertIsNone(active_prompt)
         self.assertTrue(clear_prompt)
 
+    def test_prompt_delivery_blocks_visible_readonly_choices(self) -> None:
+        item = {
+            "kind": "choices",
+            "title": "Input needed",
+            "summary": "Choose one.",
+            "text": "Choose one.\n1) A\n2) B",
+            "options": [{"number": "1", "label": "A"}, {"number": "2", "label": "B"}],
+            "prompt_id": "visible1",
+            "turn_id": "visible-readonly:visible1",
+            "choice_source": "visible_readonly",
+        }
+
+        with patch.object(herdres, "VISIBLE_CHOICE_BUTTONS_ENABLED", True):
+            markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
+
+        self.assertIsNone(markup)
+        self.assertIsNone(active_prompt)
+        self.assertTrue(clear_prompt)
+
     def test_extract_choices_skips_descriptions_between_options(self) -> None:
         raw = """Which is it? This picks the fix lever.
 
@@ -2168,6 +2187,84 @@ Codex thinks your real objection is register, not raw word count. Which is it?
         self.assertIn("value-ranker", html)
         self.assertIn("<h4>Question</h4>", html)
         self.assertIn("Codex thinks", html)
+
+    def test_visible_readonly_choice_fallback_keeps_prompt_without_buttons(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        raw = """Codex thinks your real objection is register, not raw word count. Which is it?
+
+❯ 1. Mostly register/tone
+     A short explainer is still bad.
+  2. Mostly length
+     You want shorter by default.
+  3. Both, equally
+     Length and register both matter.
+  4. Type something.
+"""
+
+        with patch.object(herdres, "pane_output", Mock(return_value=raw)):
+            item = herdres.extract_visible_readonly_feed_item(pane)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "choices")
+        self.assertEqual(item["title"], "Input needed")
+        self.assertEqual(item["choice_source"], "visible_readonly")
+        self.assertNotIn("decision_id", item)
+        self.assertTrue(str(item["turn_id"]).startswith("visible-readonly:"))
+        self.assertIn("Which is it?", item["summary"])
+        self.assertIn("Visible-screen prompt only", item["detail"])
+        html = herdres.render_feed_item_html(item)
+        self.assertIn("Codex thinks", html)
+        self.assertIn("Mostly register/tone", html)
+        self.assertIn("Visible-screen prompt only", html)
+
+        markup, active_prompt, clear_prompt = herdres.prompt_delivery_state(item)
+        self.assertIsNone(markup)
+        self.assertIsNone(active_prompt)
+        self.assertTrue(clear_prompt)
+
+    def test_visible_readonly_free_text_question_surfaces_without_buttons(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        raw = """I found two possible fixes.
+
+Should I patch the timeout guard now?
+"""
+
+        with patch.object(herdres, "pane_output", Mock(return_value=raw)):
+            item = herdres.extract_visible_readonly_feed_item(pane)
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "question")
+        self.assertEqual(item["title"], "Input needed")
+        self.assertEqual(item["choice_source"], "visible_readonly")
+        self.assertTrue(str(item["turn_id"]).startswith("visible-readonly-question:"))
+        self.assertIn("Should I patch", item["text"])
+        self.assertIn("Visible-screen prompt only", item["text"])
+
+    def test_visible_readonly_free_text_question_ignores_volatile_context(self) -> None:
+        pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
+        first = """Status line A
+I found two possible fixes.
+
+Should I patch the timeout guard now?
+"""
+        second = """Different status line B
+Additional visible context changed.
+
+Should I patch the timeout guard now?
+"""
+
+        with patch.object(herdres, "pane_output", Mock(return_value=first)):
+            first_item = herdres.extract_visible_readonly_feed_item(pane)
+        with patch.object(herdres, "pane_output", Mock(return_value=second)):
+            second_item = herdres.extract_visible_readonly_feed_item(pane)
+
+        assert first_item is not None and second_item is not None
+        self.assertEqual(first_item["turn_id"], second_item["turn_id"])
+        self.assertEqual(first_item["text"], second_item["text"])
+        self.assertNotIn("Status line", first_item["text"])
+        self.assertNotIn("Different status", second_item["text"])
 
     def test_visible_choice_fallback_uses_recent_unwrapped_context(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "idle"}
@@ -3219,7 +3316,7 @@ Verification
         self.assertEqual(reply_markup["inline_keyboard"][1][0]["callback_data"], f"herdr:c:{sent_item['prompt_id']}:full")
         self.assertIn("Which path should I take?", entry["last_clean_text"])
 
-    def test_sync_turn_feed_does_not_fall_back_to_visible_choice_prompt_by_default(self) -> None:
+    def test_sync_turn_feed_sends_visible_choice_prompt_readonly_by_default(self) -> None:
         pane = {
             "pane_id": "pane-1",
             "terminal_id": "term-1",
@@ -3264,9 +3361,70 @@ Verification
         ):
             result = herdres.sync_once()
 
-        self.assertEqual(result.get("feed_sent", 0), 0)
+        self.assertEqual(result["feed_sent"], 1)
+        send_feed_item.assert_called_once()
+        sent_item = send_feed_item.call_args.args[1]
+        self.assertEqual(sent_item["kind"], "choices")
+        self.assertEqual(sent_item["choice_source"], "visible_readonly")
+        self.assertIn("Which is it?", sent_item["summary"])
+        self.assertIn("Visible-screen prompt only", sent_item["detail"])
+        self.assertIsNone(send_feed_item.call_args.kwargs["reply_markup"])
+        self.assertEqual(entry["last_clean_kind"], "choices")
+        self.assertNotIn("active_prompt", entry)
+
+        send_feed_item.reset_mock()
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value={"available": False, "reason": "no_unique_claude_session_match"}),
+            pane_output=Mock(return_value=raw),
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            VISIBLE_CHOICE_BUTTONS_ENABLED=False,
+        ):
+            second_result = herdres.sync_once()
+
+        self.assertEqual(second_result.get("feed_sent", 0), 0)
         send_feed_item.assert_not_called()
         self.assertNotIn("active_prompt", entry)
+
+    def test_choices_command_has_no_buttons_for_readonly_prompt(self) -> None:
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {
+                "pane-1": {
+                    "pane_id": "pane-1",
+                    "topic_id": "77",
+                    "last_clean_item": {
+                        "kind": "choices",
+                        "choice_source": "visible_readonly",
+                        "prompt_id": "prompt1",
+                        "options": [{"number": "1", "label": "A"}, {"number": "2", "label": "B"}],
+                    },
+                }
+            },
+        }
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            send_feed_item=Mock(),
+        ):
+            result = herdres.command_reply(
+                {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "text": "/choices"}
+            )
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["reply"], "No active choices for this pane.")
 
     def test_sync_turn_feed_visible_choice_prompt_is_opt_in(self) -> None:
         pane = {
