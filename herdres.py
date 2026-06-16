@@ -1592,6 +1592,13 @@ def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[
             item = extract_visible_choice_feed_item(pane)
         elif VISIBLE_READONLY_PROMPTS_ENABLED:
             item = extract_visible_readonly_feed_item(pane)
+    if not item and turn.get("complete") is True and turn.get("has_open_turn") is True:
+        # The agent finished a reply and immediately auto-continued (a new turn
+        # opened) without asking the user anything, so neither the structured
+        # nor the visible-question path produced an item. Deliver that completed
+        # final message anyway instead of dropping it; downstream dedup keeps it
+        # to a single post even while the follow-up turn is still in progress.
+        item = make_turn_feed_item({**turn, "has_open_turn": False})
     if item:
         entry["last_turn_id"] = item.get("turn_id") or ""
     return item

@@ -2419,6 +2419,32 @@ Which file changed. Should the report include the full diff? Files touched:
         self.assertEqual(item["kind"], "decision")
         self.assertEqual(item["decision_id"], "decision-1")
 
+    def test_extract_turn_feed_item_delivers_completed_turn_after_auto_continue(self) -> None:
+        # The agent finished a reply and immediately auto-pursued a new goal, so a
+        # new turn is already open (has_open_turn) with no question awaiting the
+        # user. make_turn_feed_item drops it and the visible-question fallbacks find
+        # nothing, but the completed final message must still be delivered.
+        pane = {"pane_id": "pane-1", "agent": "codex", "agent_status": "working"}
+        turn = {
+            "available": True,
+            "complete": True,
+            "has_open_turn": True,
+            "turn_id": "finished-turn",
+            "assistant_final_text": "Here is the final answer before auto-continuing.",
+        }
+        with (
+            patch.object(herdres, "pane_turn", Mock(return_value=turn)),
+            patch.object(herdres, "extract_visible_choice_feed_item", Mock(return_value=None)),
+            patch.object(herdres, "extract_visible_readonly_feed_item", Mock(return_value=None)),
+        ):
+            item = herdres.extract_turn_feed_item(pane, {})
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["kind"], "turn")
+        self.assertEqual(item["turn_id"], "finished-turn")
+        self.assertIn("final answer before auto-continuing", item["assistant_final_text"])
+
     def test_open_completed_turn_falls_back_to_visible_readonly_prompt(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "blocked"}
         turn = {
