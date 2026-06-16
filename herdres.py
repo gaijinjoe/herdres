@@ -101,7 +101,7 @@ ALLOW_UNBOUNDED_REPORTS = os.getenv("HERDR_TELEGRAM_TOPICS_UNBOUNDED_REPORTS", "
     "yes",
     "on",
 }
-RICH_RENDER_VERSION = 14
+RICH_RENDER_VERSION = 15
 FEED_READ_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_READ_LINES", "140"))
 FEED_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FEED_MAX_CHARS", "9000"))
 FINAL_REPLY_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_FINAL_REPLY_MAX_CHARS", "16000"))
@@ -2137,6 +2137,32 @@ TURN_KNOWN_HEADING_KEYS = {
     "summary",
     "result",
 }
+TURN_STATUS_HEADING_KEYS = {
+    "fixed",
+    "done",
+    "failed",
+    "resolved",
+    "blocked",
+    "reverted",
+    "shipped",
+    "deployed",
+}
+TURN_INLINE_SECTION_LABELS = {
+    "what happened": "What happened",
+    "why it happened": "Why it happened",
+    "impact": "Impact",
+    "fix": "Fix",
+    "current status": "Current status",
+    "next step": "Next step",
+    "result": "Result",
+    "verification": "Verification",
+}
+TURN_INLINE_SECTION_RE = re.compile(
+    r"^("
+    + "|".join(re.escape(label) for label in sorted(TURN_INLINE_SECTION_LABELS, key=len, reverse=True))
+    + r"):\s+(.+)$",
+    re.IGNORECASE,
+)
 
 
 def _plain_heading_title(value: str) -> str:
@@ -2205,9 +2231,9 @@ def _rich_commit_line(line: str) -> str | None:
     return f"<p><code>{_html_text(match.group(1), 40)}</code> {_rich_inline(match.group(2), 500)}</p>"
 
 
-def _lead_heading_split(line: str) -> tuple[str, str] | None:
+def _lead_heading_split(line: str, *, allow_status_title: bool = False) -> tuple[str, str] | None:
     clean = str(line or "").strip()
-    match = re.match(r"^(.{8,100}?)\s+[—–]\s+(.+)$", clean)
+    match = re.match(r"^(.{2,100}?)\s+[—–]\s+(.+)$", clean)
     if not match:
         return None
     raw_title = match.group(1).strip()
@@ -2218,15 +2244,30 @@ def _lead_heading_split(line: str) -> tuple[str, str] | None:
         rest = f"{meta_match.group(1)} — {rest}"
     title = _plain_heading_title(raw_title).rstrip(":").rstrip(".").strip()
     words = title.split()
-    if not 2 <= len(words) <= 8:
+    title_key = title.lower()
+    if len(words) == 1 and allow_status_title and title_key in TURN_STATUS_HEADING_KEYS:
+        pass
+    elif not 2 <= len(words) <= 8:
         return None
-    if title.lower() in {"yes", "no", "ok", "okay", "done"}:
+    if title_key in {"yes", "no", "ok", "okay"}:
         return None
     if title.endswith(("?", "!", ",")):
         return None
     if not rest:
         return None
     return title, rest
+
+
+def _inline_section_split(line: str) -> tuple[str, str] | None:
+    clean = str(line or "").strip()
+    match = TURN_INLINE_SECTION_RE.match(clean)
+    if not match:
+        return None
+    title = TURN_INLINE_SECTION_LABELS.get(match.group(1).lower())
+    body = match.group(2).strip()
+    if not title or not body:
+        return None
+    return title, body
 
 
 def _split_long_paragraph(value: str, *, max_chars: int = 360) -> list[str]:
@@ -2434,12 +2475,23 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             idx += 1
             continue
 
-        lead_split = _lead_heading_split(line) if (previous_blank or not seen_heading) else None
+        lead_split = _lead_heading_split(line, allow_status_title=not seen_heading) if (previous_blank or not seen_heading) else None
         if lead_split:
             title, rest = lead_split
             tag = "h3" if not seen_heading else "h4"
             parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
             parts.extend(_rich_paragraph_blocks(rest))
+            seen_heading = True
+            previous_blank = False
+            idx += 1
+            continue
+
+        inline_section = _inline_section_split(line)
+        if inline_section:
+            title, body = inline_section
+            tag = "h3" if not seen_heading else "h4"
+            parts.append(f"<{tag}>{_html_text(title, 100)}</{tag}>")
+            parts.extend(_rich_paragraph_blocks(body))
             seen_heading = True
             previous_blank = False
             idx += 1
@@ -2471,6 +2523,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 or _is_codeish_line(candidate)
                 or (_is_table_line(candidate) and idx + 1 < len(lines) and _is_table_line(str(lines[idx + 1])))
                 or _is_turn_heading_line(candidate, candidate_next, first_block=False, previous_blank=False)
+                or _inline_section_split(candidate)
             ):
                 break
             paragraph.append(candidate.strip())

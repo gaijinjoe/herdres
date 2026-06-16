@@ -3410,6 +3410,44 @@ Verification
         self.assertGreaterEqual(html.count("<p>"), 3)
         self.assertNotIn("`", html)
 
+    def test_dense_codex_status_turn_splits_inline_sections(self) -> None:
+        text = """Fixed — it's genuinely reviewing now (Codex worker at 11% CPU, model: gpt-5.5, sandbox: read-only, xhigh). The earlier Reading additional input from stdin... line is now harmless (it hit /dev/null -> immediate EOF -> proceeded).
+What happened: my first Codex review invocation was malformed — codex exec was given the prompt as an argument and an open stdin (because I backgrounded it), and per its docs it then waits to append stdin as a <stdin> block. With nothing ever closing stdin, it blocked for 2h12m at 0% CPU and produced zero review.
+No harm done (it was read-only and did nothing), but it wasted time.
+Fix: the one-character-class change was < /dev/null so stdin closes immediately.
+Now the real Codex 5.5 xhigh review of the plan is running. When it lands I'll report exactly where Codex and I agree/disagree and run another round if needed — then, since you've approved, proceed to implement.
+"""
+
+        html = herdres.render_final_reply_html(text)
+
+        self.assertIn("<h3>Fixed</h3>", html)
+        self.assertIn("<h4>What happened</h4>", html)
+        self.assertIn("<h4>Fix</h4>", html)
+        self.assertIn("genuinely reviewing now", html)
+        self.assertIn("2h12m", html)
+        self.assertIn("No harm done", html)
+        self.assertNotIn("What happened: my first", html)
+        self.assertNotIn("<h4>model</h4>", html)
+        self.assertNotIn("<h4>sandbox</h4>", html)
+
+    def test_dense_turn_inline_section_split_is_strict(self) -> None:
+        html = herdres.render_final_reply_html(
+            "Fixed the bug now\n"
+            "Note: this should remain a paragraph.\n"
+            "Example: this should also remain a paragraph.\n"
+            "The change: keep it inline, not a heading.\n"
+            "- Fix: this bullet should stay a bullet.\n"
+            "What changed:\n"
+            "- tests OK"
+        )
+
+        self.assertNotIn("<h3>Fixed</h3>", html)
+        self.assertNotIn("<h4>Note</h4>", html)
+        self.assertNotIn("<h4>Example</h4>", html)
+        self.assertNotIn("<h4>The change</h4>", html)
+        self.assertIn("<li>Fix: this bullet should stay a bullet.</li>", html)
+        self.assertEqual(html.count("<h4>What changed</h4>"), 1)
+
     def test_oversized_turn_fallback_keeps_more_than_tiny_summary(self) -> None:
         text = "Implemented.\n" + "\n".join(
             f"- Item {idx}: `renamed={idx}` with enough text to inflate rich HTML output."
