@@ -61,7 +61,7 @@ STATUS_MARKER_SUPPRESS_WHEN_ICON_OK = os.getenv(
     "1",
 ).lower() in {"1", "true", "yes", "on"}
 CLEAN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_FEED", "1").lower() in {"1", "true", "yes", "on"}
-TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "0").lower() in {"1", "true", "yes", "on"}
+TURN_FEED_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_TURN_FEED", "1").lower() in {"1", "true", "yes", "on"}
 RICH_MESSAGES_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_RICH_MESSAGES", "1").lower() in {"1", "true", "yes", "on"}
 LIVE_CARD_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_LIVE_CARD", "1").lower() in {"1", "true", "yes", "on"}
 STATUS_MARKER_ENABLED = os.getenv("HERDR_TELEGRAM_TOPICS_STATUS_MARKER", "1").lower() in {"1", "true", "yes", "on"}
@@ -2580,6 +2580,19 @@ def clean_feed_hash(item: dict[str, Any], *, include_render_version: bool = True
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def same_delivered_content(entry: dict[str, Any], item: dict[str, Any], item_semantic_hash: str) -> bool:
+    previous_semantic_hash = str(entry.get("last_clean_semantic_hash") or "")
+    if previous_semantic_hash and previous_semantic_hash == item_semantic_hash:
+        return True
+    turn_id = str(item.get("turn_id") or "")
+    previous_turn_id = str(entry.get("last_turn_id") or (entry.get("last_clean_item") or {}).get("turn_id") or "")
+    if turn_id and previous_turn_id and turn_id == previous_turn_id:
+        previous_text = str(entry.get("last_clean_text") or "").strip()
+        if previous_text and previous_text == item_plain_text(item).strip():
+            return True
+    return False
+
+
 def recent_attempt(entry: dict[str, Any], item_hash: str, ttl_seconds: int = CLEAN_ATTEMPT_TTL_SECONDS) -> bool:
     if entry.get("last_clean_attempt_hash") != item_hash:
         return False
@@ -4194,9 +4207,8 @@ def sync_pane_once(
         if item:
             item_render_hash = clean_feed_hash(item)
             item_semantic_hash = clean_feed_hash(item, include_render_version=False)
-            previous_semantic_hash = str(entry.get("last_clean_semantic_hash") or "")
             previous_render_hash = str(entry.get("last_clean_render_hash") or entry.get("last_clean_hash") or "")
-            same_semantic = bool(previous_semantic_hash and previous_semantic_hash == item_semantic_hash)
+            same_semantic = same_delivered_content(entry, item, item_semantic_hash)
             render_changed = item_render_hash != previous_render_hash
             content_changed = not same_semantic
             should_deliver = old_clean_has_noise or content_changed or render_changed
@@ -4218,14 +4230,25 @@ def sync_pane_once(
                     if result.get("ok"):
                         did_edit = True
                     elif result.get("not_found"):
-                        result = send_feed_item(
-                            chat_id,
-                            item,
-                            telegram=telegram,
-                            thread_id=entry["topic_id"],
-                            notify=bool(item.get("notify")),
-                            reply_markup=reply_markup,
-                        )
+                        if content_changed:
+                            result = send_feed_item(
+                                chat_id,
+                                item,
+                                telegram=telegram,
+                                thread_id=entry["topic_id"],
+                                notify=bool(item.get("notify")),
+                                reply_markup=reply_markup,
+                            )
+                        else:
+                            entry["last_clean_render_hash"] = item_render_hash
+                            entry["last_clean_hash"] = item_render_hash
+                            entry["last_clean_semantic_hash"] = item_semantic_hash
+                            entry["last_clean_text"] = item_plain_text(item)
+                            entry["last_clean_item"] = item
+                            entry["last_clean_message_missing_at"] = utc_now()
+                            entry.pop("last_clean_send_error", None)
+                            changed = True
+                            result = {"ok": False, "kind": "not_found", "skipped_stale_repost": True}
                     else:
                         result = {**result, "edit_failed": True}
                 else:
@@ -4262,6 +4285,8 @@ def sync_pane_once(
                     clear_topic_mapping(entry, str(result.get("error") or result))
                     save_state(state)
                     return True
+                elif result.get("skipped_stale_repost"):
+                    changed = True
                 else:
                     entry["last_clean_send_error"] = sanitize_text(str(result), 500)
                     changed = True

@@ -1123,6 +1123,7 @@ What changed:
             preflight_is_fresh=Mock(return_value=True),
             pane_feed_output=Mock(return_value="HERDRES_REPORT_START\nFix\n- Fixed extraction.\nHERDRES_REPORT_END"),
             send_feed_item=Mock(return_value={"ok": False, "format": "rich", "error": "temporary"}),
+            TURN_FEED_ENABLED=False,
             LIVE_CARD_ENABLED=False,
         ):
             result = herdres.sync_once()
@@ -1158,6 +1159,7 @@ What changed:
             "preflight_is_fresh": Mock(return_value=True),
             "pane_feed_output": Mock(return_value="HERDRES_REPORT_START\nFix\n- Fixed extraction.\nHERDRES_REPORT_END"),
             "send_feed_item": send_feed_item,
+            "TURN_FEED_ENABLED": False,
             "LIVE_CARD_ENABLED": False,
         }
 
@@ -1210,6 +1212,7 @@ What changed:
             pane_feed_output=Mock(return_value=raw),
             edit_feed_item=edit_feed_item,
             send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=False,
             LIVE_CARD_ENABLED=False,
         ):
             result = herdres.sync_once()
@@ -1219,6 +1222,123 @@ What changed:
         send_feed_item.assert_not_called()
         self.assertEqual(entry["last_clean_message_id"], "999")
         self.assertEqual(entry["last_clean_render_hash"], herdres.clean_feed_hash(item))
+
+    def test_same_turn_text_does_not_resend_when_hash_state_is_missing(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        turn = {
+            "available": True,
+            "complete": True,
+            "turn_id": "turn-1",
+            "user_text": "Check the watcher.",
+            "assistant_final_text": "Watcher is idle and healthy.",
+        }
+        item = herdres.make_turn_feed_item(turn)
+        assert item is not None
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "last_turn_id": "turn-1",
+            "last_clean_text": herdres.item_plain_text(item),
+            "last_clean_message_id": "999",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1000"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value=turn),
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        send_feed_item.assert_not_called()
+        self.assertEqual(entry["last_clean_message_id"], "999")
+
+    def test_render_only_missing_old_message_does_not_repost_stale_turn(self) -> None:
+        pane = {
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "workspace_id": "workspace-1",
+            "tab_id": "tab-1",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        turn = {
+            "available": True,
+            "complete": True,
+            "turn_id": "turn-1",
+            "user_text": "Check the watcher.",
+            "assistant_final_text": "Watcher is idle and healthy.",
+        }
+        item = herdres.make_turn_feed_item(turn)
+        assert item is not None
+        key = herdres.pane_key(pane)
+        entry = {
+            "pane_key": key,
+            "pane_id": "pane-1",
+            "topic_id": "77",
+            "last_turn_id": "turn-1",
+            "last_clean_semantic_hash": herdres.clean_feed_hash(item, include_render_version=False),
+            "last_clean_render_hash": "old-render",
+            "last_clean_hash": "old-render",
+            "last_clean_text": herdres.item_plain_text(item),
+            "last_clean_message_id": "999",
+        }
+        state = {
+            "version": 1,
+            "enabled": True,
+            "telegram": {"chat_id": "-1001", "general_thread_id": "1", "owner_user_ids": ["42"]},
+            "panes": {key: entry},
+        }
+        edit_feed_item = Mock(return_value={"ok": False, "not_found": True, "kind": "not_found"})
+        send_feed_item = Mock(return_value={"ok": True, "message_id": "1000"})
+
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            pane_list=Mock(return_value=[pane]),
+            preflight_is_fresh=Mock(return_value=True),
+            pane_turn=Mock(return_value=turn),
+            edit_feed_item=edit_feed_item,
+            send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=True,
+            LIVE_CARD_ENABLED=False,
+            STATUS_MARKER_ENABLED=False,
+        ):
+            result = herdres.sync_once()
+
+        self.assertTrue(result["changed"])
+        edit_feed_item.assert_called_once()
+        send_feed_item.assert_not_called()
+        self.assertEqual(entry["last_clean_message_id"], "999")
+        self.assertEqual(entry["last_clean_render_hash"], herdres.clean_feed_hash(item))
+        self.assertIn("last_clean_message_missing_at", entry)
+        self.assertNotIn("last_clean_send_error", entry)
 
     def test_sync_suppresses_resume_transcript_until_bounded_report(self) -> None:
         pane = {
@@ -1254,6 +1374,7 @@ What changed:
             preflight_is_fresh=Mock(return_value=True),
             pane_feed_output=Mock(return_value="Conversation interrupted and goal paused.\n\nSummary:\nPrevious state."),
             send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=False,
             LIVE_CARD_ENABLED=False,
         ):
             first = herdres.sync_once()
@@ -1298,6 +1419,7 @@ What changed:
             preflight_is_fresh=Mock(return_value=True),
             pane_feed_output=Mock(return_value="Question\nWould you like me to deploy now?"),
             send_feed_item=send_feed_item,
+            TURN_FEED_ENABLED=False,
             LIVE_CARD_ENABLED=False,
         ):
             result = herdres.sync_once()
