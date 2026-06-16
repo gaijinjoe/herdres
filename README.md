@@ -324,6 +324,7 @@ The intended future contract for multi-question prompts is a normalized structur
 ```
 
 Until Herdr or the local adapter exposes a semantic submit path for this shape, Herdres fails closed rather than sending native TUI keys for multi-question forms.
+In this phase, `pending_interaction` is read-only even when `kind` is `single_question` and options include `value` or `send_text`; producers that want immediate Telegram buttons should continue to emit `pending_decision`.
 
 If Herdr cannot provide structured turn data, it should return:
 
