@@ -2431,6 +2431,27 @@ def _rich_paragraph_blocks(value: str) -> list[str]:
 TEXT_FENCE_LANGS = {"text", "txt", "plain", "plaintext", "markdown", "md"}
 
 
+def _text_fence_is_preformatted(code_lines: list[str]) -> bool:
+    # A ```text fence usually holds prose / a numbered list (render as readable
+    # text), but sometimes holds aligned tables, command syntax, or indented
+    # output that NEEDS monospace. Keep it as a code block in that case.
+    lines = [ln for ln in code_lines if ln.strip()]
+    if not lines:
+        return False
+    listish = sum(1 for ln in lines if re.match(r"^\s*(?:\d{1,2}[.)]|[-*+•])\s", ln))
+    if listish * 2 >= len(lines):
+        return False
+    pre = 0
+    for ln in lines:
+        if re.search(r"\S {2,}\S", ln) or "|" in ln:
+            pre += 1
+        elif re.search(r"[{};]|=>|::|\b(?:def|class|import|function|sudo|systemctl|journalctl|curl|ssh|export|chmod|mkdir)\b", ln):
+            pre += 1
+        elif ln[:1] in (" ", "\t"):
+            pre += 1
+    return pre * 2 >= len(lines)
+
+
 def _render_text_fence(code_lines: list[str]) -> str:
     # Codex wraps prose / numbered steps / field lists in ```text fences. Render
     # them as readable text (line breaks preserved via <br>, blank lines as gaps),
@@ -2476,7 +2497,7 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
                 idx += 1
             if idx < len(lines):
                 idx += 1
-            if language.lower() in TEXT_FENCE_LANGS:
+            if language.lower() in TEXT_FENCE_LANGS and not _text_fence_is_preformatted(code_lines):
                 rendered_fence = _render_text_fence(code_lines)
                 if rendered_fence:
                     parts.append(rendered_fence)

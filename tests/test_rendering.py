@@ -5201,5 +5201,42 @@ def callback_patches(
     )
 
 
+class CodexFenceAndAcronymTests(unittest.TestCase):
+    def test_text_fence_numbered_list_is_not_code_block(self) -> None:
+        html = herdres.render_final_reply_html("Steps:\n\n```text\n1. Backup files.\n2. Restart service.\n3. Verify.\n```")
+        self.assertNotIn("<pre>", html)
+        self.assertIn("1. Backup files.", html)
+
+    def test_text_fence_prose_is_not_code_block(self) -> None:
+        html = herdres.render_final_reply_html("```text\nThis is an explanatory paragraph about the plan and what it does.\n```")
+        self.assertNotIn("<pre>", html)
+
+    def test_text_fence_aligned_table_stays_monospace(self) -> None:
+        html = herdres.render_final_reply_html("```text\nAsia key:     6M0JL4hlOhIAY=\nRegistry key: Vhqghgj95WH0xHI=\n```")
+        self.assertIn("<pre>", html)
+
+    def test_text_fence_command_syntax_stays_monospace(self) -> None:
+        html = herdres.render_final_reply_html("```text\nclaude --session-id <uuid> --settings <file>\n    --profile prod\n```")
+        self.assertIn("<pre>", html)
+
+    def test_real_language_fence_stays_code(self) -> None:
+        html = herdres.render_final_reply_html("```bash\nsystemctl --user restart herdres\n```")
+        self.assertIn('<pre><code class="language-bash">', html)
+
+    def test_plain_acronyms_not_monospaced(self) -> None:
+        html = herdres.render_final_reply_html("We use UDP and TURN over the VPS for the FAQ.")
+        for a in ("UDP", "TURN", "VPS", "FAQ"):
+            self.assertNotIn("<code>%s</code>" % a, html)
+
+    def test_constant_with_underscore_or_digit_stays_code(self) -> None:
+        html = herdres.render_final_reply_html("Set MAX_CHARS and check HTTP2 support.")
+        self.assertIn("<code>MAX_CHARS</code>", html)
+        self.assertIn("<code>HTTP2</code>", html)
+
+    def test_blocks_separated_by_br(self) -> None:
+        html = herdres.render_final_reply_html("First paragraph here.\n\nSecond paragraph here.")
+        self.assertIn("<br>", html)
+
+
 if __name__ == "__main__":
     unittest.main()
