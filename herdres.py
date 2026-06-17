@@ -1576,6 +1576,36 @@ def extract_visible_readonly_feed_item(pane: dict[str, Any]) -> dict[str, Any] |
     return extract_visible_readonly_question_item(pane)
 
 
+def select_turn_feed_item(turn: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Pick the feed item for this turn, catching up on undelivered turns.
+
+    When the adapter exposes recent completed turns and we have already
+    delivered one of them, emit the OLDEST not-yet-delivered turn so a burst of
+    completions (e.g. a human-prompted reply immediately followed by an
+    auto-pursued turn) is delivered in order across successive sync cycles
+    instead of collapsing to only the newest one. The cursor is the last
+    *confirmed-delivered* turn (last_clean_item), so a failed send re-selects the
+    same turn rather than skipping it. Falls back to the latest turn when there
+    is nothing to catch up on or the delivered cursor is no longer in the window.
+    """
+    if isinstance(turn, dict):
+        recent = turn.get("recent_turns")
+        if isinstance(recent, list) and len(recent) >= 2:
+            delivered = str(
+                (entry.get("last_clean_item") or {}).get("turn_id")
+                or entry.get("last_turn_id")
+                or ""
+            )
+            ids = [str(t.get("turn_id") or "") for t in recent]
+            if delivered and delivered in ids:
+                idx = ids.index(delivered)
+                if idx < len(recent) - 1:
+                    catch_up = make_turn_feed_item(recent[idx + 1])
+                    if catch_up:
+                        return catch_up
+    return make_turn_feed_item(turn)
+
+
 def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
     turn = pane_turn(str(pane.get("pane_id") or ""))
     available = bool(turn.get("available", True))
@@ -1586,7 +1616,7 @@ def extract_turn_feed_item(pane: dict[str, Any], entry: dict[str, Any]) -> dict[
             entry["last_turn_reason"] = reason
         else:
             entry.pop("last_turn_reason", None)
-    item = make_turn_feed_item(turn)
+    item = select_turn_feed_item(turn, entry)
     if not item:
         if VISIBLE_CHOICE_BUTTONS_ENABLED:
             item = extract_visible_choice_feed_item(pane)

@@ -20,6 +20,10 @@ DEFAULT_REAL_HERDR = "herdr"
 MAX_TEXT_CHARS = int(os.getenv("HERDRES_TURN_ADAPTER_MAX_TEXT_CHARS", "12000"))
 CLAUDE_FALLBACK_MAX_FILES = int(os.getenv("HERDRES_CLAUDE_FALLBACK_MAX_FILES", "24"))
 CLAUDE_FALLBACK_READ_LINES = int(os.getenv("HERDRES_CLAUDE_FALLBACK_READ_LINES", "160"))
+# How many recent completed turns to expose so the bridge can catch up on a
+# burst of completions (e.g. a reply immediately followed by an auto-pursued
+# turn) instead of collapsing to only the newest one.
+RECENT_TURNS = int(os.getenv("HERDRES_RECENT_TURNS", "12"))
 
 
 def real_herdr_bin() -> str:
@@ -220,7 +224,111 @@ def claude_sibling_count(pane: dict[str, Any]) -> int:
     return count or 1
 
 
+def proc_starttime(pid: int) -> str | None:
+    """Field 22 (starttime, in clock ticks) of /proc/<pid>/stat, or None.
+
+    comm (field 2) can contain spaces and parentheses, so we split on the LAST
+    ')' and index the remainder: field 22 is index 19 of what follows ") ".
+    Used as a PID-reuse guard against Claude's pid->session mapping file.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+            data = handle.read()
+        rest = data[data.rfind(")") + 2:]
+        return rest.split()[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def claude_pid_for_pane(pane_id: str) -> int | None:
+    """The live claude PID for a pane via `herdr pane process-info`.
+
+    Deterministic: Herdr reports the pane's foreground process. claude is its
+    own process-group leader, so foreground_process_group_id is a safe fallback
+    when a child (bash/node) is momentarily the named foreground process.
+    """
+    try:
+        data = run_real_herdr_json(["pane", "process-info", "--pane", pane_id])
+        info = data.get("result", {}).get("process_info", {})
+        procs = info.get("foreground_processes")
+        if isinstance(procs, list):
+            for proc in procs:
+                if not isinstance(proc, dict):
+                    continue
+                argv = proc.get("argv")
+                argv0 = str(argv[0]) if isinstance(argv, list) and argv else ""
+                if str(proc.get("name") or "") == "claude" or argv0 == "claude":
+                    return int(proc["pid"])
+        pgid = info.get("foreground_process_group_id")
+        if pgid is not None:
+            return int(pgid)
+    except (RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired, OSError, KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def claude_sessions_dir() -> Path:
+    return Path(os.getenv("CLAUDE_SESSIONS_DIR", str(Path.home() / ".claude/sessions"))).expanduser()
+
+
+def claude_session_record_for_pid(pid: int, expected_cwd: str = "") -> dict[str, Any] | None:
+    """Read Claude's own ~/.claude/sessions/<PID>.json pid->sessionId record.
+
+    This is the authoritative binding Codex exposes via agent_session.value but
+    Claude does not surface to Herdr. Guarded against PID reuse (procStart must
+    match /proc) and a definite cwd mismatch. Any broken hop returns None so the
+    caller falls through to the existing heuristics — never worse than today.
+    """
+    try:
+        record = json.loads((claude_sessions_dir() / f"{pid}.json").read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    session_id = str(record.get("sessionId") or "")
+    if not session_id:
+        return None
+    started = proc_starttime(pid)
+    if started is not None and str(record.get("procStart")) != str(started):
+        return None  # PID was recycled; this mapping file is stale.
+    record_cwd = str(record.get("cwd") or "")
+    if expected_cwd and record_cwd and record_cwd != expected_cwd:
+        return None
+    return {"sessionId": session_id, "cwd": record_cwd, "procStart": record.get("procStart")}
+
+
+def resolve_claude_session_via_pid(pane: dict[str, Any], pane_id: str) -> tuple[Path | None, str]:
+    """Deterministic pane -> PID -> sessionId -> session file. ('', None) on any miss."""
+    expected_cwd = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+    pid = claude_pid_for_pane(pane_id)
+    if pid is None:
+        return (None, "")
+    record = claude_session_record_for_pid(pid, expected_cwd)
+    if record is None:
+        return (None, "")
+    session_id = record["sessionId"]
+    project_dir = claude_project_dir_for_cwd(expected_cwd)
+    if project_dir:
+        candidate = project_dir / f"{session_id}.jsonl"
+        if candidate.exists():
+            return (candidate, session_id)
+    path = claude_session_path(session_id)
+    if path is None or not path.exists():
+        return (None, "")
+    return (path, session_id)
+
+
 def infer_claude_turn_from_visible_pane(pane: dict[str, Any], pane_id: str) -> dict[str, Any]:
+    # PRIMARY: deterministic pane -> PID -> sessionId via Claude's own pid map.
+    # Reads exactly one session file (no project-dir glob, no sibling pane-list
+    # call, no visible-text scrape), which also removes the timeout class for
+    # large project dirs. Falls through to the heuristics only on a broken hop.
+    pid_path, pid_sid = resolve_claude_session_via_pid(pane, pane_id)
+    if pid_path is not None:
+        turn = extract_claude_turn(pid_path, pane_id, pid_sid)
+        turn["session_match_source"] = "pid_session_map"
+        return result_turn(turn)
+
     candidates: list[tuple[float, Path, dict[str, Any]]] = []
     for path in claude_candidate_paths_for_pane(pane):
         turn = extract_claude_turn(path, pane_id, path.stem)
@@ -269,7 +377,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
     current_started_at: Any = None
     current_user_text = ""
     last_assistant_text = ""
-    latest_complete: dict[str, Any] | None = None
+    completed: list[dict[str, Any]] = []
     open_turn = False
 
     with path.open(encoding="utf-8", errors="replace") as handle:
@@ -299,7 +407,7 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                 if not final_text:
                     final_text = last_assistant_text
                 if final_text and current_user_text:
-                    latest_complete = {
+                    completed.append({
                         "available": True,
                         "pane_id": pane_id,
                         "agent": "codex",
@@ -312,16 +420,20 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
                         "completed_at": payload.get("completed_at"),
                         "user_text": current_user_text,
                         "assistant_final_text": final_text,
-                    }
+                    })
                 open_turn = False
                 continue
             if event.get("type") == "event_msg" and payload.get("type") == "turn_aborted":
                 open_turn = False
 
-    if open_turn and latest_complete:
-        latest_complete["has_open_turn"] = True
-        latest_complete["open_turn_id"] = current_turn_id
-        return latest_complete
+    if completed:
+        recent = completed[-RECENT_TURNS:]
+        latest = dict(recent[-1])
+        if open_turn:
+            latest["has_open_turn"] = True
+            latest["open_turn_id"] = current_turn_id
+        latest["recent_turns"] = recent
+        return latest
     if open_turn:
         return {
             "available": True,
@@ -333,8 +445,6 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
             "user_text": current_user_text,
             "assistant_final_text": "",
         }
-    if latest_complete:
-        return latest_complete
     return {
         "available": True,
         "pane_id": pane_id,
@@ -348,7 +458,8 @@ def extract_codex_turn(path: Path, pane_id: str, session_id: str) -> dict[str, A
 def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, Any]:
     pending_user_text = ""
     pending_user_uuid = ""
-    latest_complete: dict[str, Any] | None = None
+    consumed_user_uuid = ""  # uuid of the last real prompt already paired to an end_turn
+    completed: list[dict[str, Any]] = []
     incomplete_user = False
 
     with path.open(encoding="utf-8", errors="replace") as handle:
@@ -361,15 +472,27 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
             msg = event.get("message") if isinstance(event.get("message"), dict) else {}
             if event_type == "user":
                 text = content_text(msg.get("content")).strip()
-                if text:
-                    pending_user_text = "" if is_internal_claude_user_text(text) else sanitize_text(text)
-                    pending_user_uuid = str(event.get("uuid") or "")
+                uuid = str(event.get("uuid") or "")
+                if text and not is_internal_claude_user_text(text):
+                    # A real human prompt: it opens a new turn boundary.
+                    pending_user_text = sanitize_text(text)
+                    pending_user_uuid = uuid
                     incomplete_user = True
+                else:
+                    # Internal (<task-notification> etc.) or empty user event. It
+                    # still marks a turn boundary, but must NOT destroy a real
+                    # prompt that has not yet been answered — otherwise the reply
+                    # to that prompt would post with an empty "You asked" block.
+                    real_prompt_armed = bool(pending_user_text) and pending_user_uuid != consumed_user_uuid
+                    if not real_prompt_armed:
+                        pending_user_text = ""
+                        pending_user_uuid = uuid
+                        incomplete_user = True
                 continue
             if event_type == "assistant":
                 text = content_text(msg.get("content")).strip()
                 if text and msg.get("stop_reason") == "end_turn" and pending_user_uuid:
-                    latest_complete = {
+                    turn = {
                         "available": True,
                         "pane_id": pane_id,
                         "agent": "claude",
@@ -381,14 +504,26 @@ def extract_claude_turn(path: Path, pane_id: str, session_id: str) -> dict[str, 
                         "completed_at": event.get("timestamp"),
                         "user_text": pending_user_text,
                         "assistant_final_text": sanitize_text(text),
+                        "_prompt_uuid": pending_user_uuid,
                     }
+                    # Coalesce consecutive end_turns under the same prompt (the
+                    # last non-empty assistant message wins) rather than emitting
+                    # a duplicate turn for the same prompt.
+                    if completed and completed[-1].get("_prompt_uuid") == pending_user_uuid:
+                        completed[-1] = turn
+                    else:
+                        completed.append(turn)
+                    consumed_user_uuid = pending_user_uuid
                     incomplete_user = False
 
-    if latest_complete:
+    if completed:
+        recent = [{k: v for k, v in t.items() if k != "_prompt_uuid"} for t in completed[-RECENT_TURNS:]]
+        latest = dict(recent[-1])
         if incomplete_user:
-            latest_complete["has_open_turn"] = True
-            latest_complete["open_turn_id"] = pending_user_uuid
-        return latest_complete
+            latest["has_open_turn"] = True
+            latest["open_turn_id"] = pending_user_uuid
+        latest["recent_turns"] = recent
+        return latest
     if incomplete_user:
         return {
             "available": True,

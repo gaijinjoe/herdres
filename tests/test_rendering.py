@@ -2445,6 +2445,41 @@ Which file changed. Should the report include the full diff? Files touched:
         self.assertEqual(item["turn_id"], "finished-turn")
         self.assertIn("final answer before auto-continuing", item["assistant_final_text"])
 
+    def test_select_turn_feed_item_catches_up_oldest_undelivered(self) -> None:
+        # A burst of completions must be delivered in order (oldest undelivered
+        # first), not collapsed to only the newest — the live X Issues case where
+        # "PR #207 merged" (human-prompted) preceded an auto-pursued "Deployed".
+        def mk(tid: str, user: str, asst: str) -> dict:
+            return {"available": True, "complete": True, "turn_id": tid,
+                    "user_text": user, "assistant_final_text": asst}
+
+        a = mk("A", "p1", "answer A")
+        b = mk("B", "you did it again", "PR #207 merged")
+        c = mk("C", "", "Deployed and verified.")
+        turn = {**c, "recent_turns": [a, b, c]}
+
+        # delivered A -> next undelivered is B (with its real prompt)
+        item = herdres.select_turn_feed_item(turn, {"last_clean_item": {"turn_id": "A"}})
+        assert item is not None
+        self.assertEqual(item["turn_id"], "B")
+        self.assertIn("you did it again", item["text"])
+        # delivered B -> next is C
+        item = herdres.select_turn_feed_item(turn, {"last_clean_item": {"turn_id": "B"}})
+        assert item is not None
+        self.assertEqual(item["turn_id"], "C")
+        # delivered C (already the latest) -> latest, dedup handles the no-op
+        item = herdres.select_turn_feed_item(turn, {"last_clean_item": {"turn_id": "C"}})
+        assert item is not None
+        self.assertEqual(item["turn_id"], "C")
+        # unknown cursor (window overflow / new pane) -> latest only, no history dump
+        item = herdres.select_turn_feed_item(turn, {"last_turn_id": "ZZZ"})
+        assert item is not None
+        self.assertEqual(item["turn_id"], "C")
+        # no recent_turns -> latest
+        item = herdres.select_turn_feed_item(c, {})
+        assert item is not None
+        self.assertEqual(item["turn_id"], "C")
+
     def test_open_completed_turn_falls_back_to_visible_readonly_prompt(self) -> None:
         pane = {"pane_id": "pane-1", "agent": "claude", "agent_status": "blocked"}
         turn = {
