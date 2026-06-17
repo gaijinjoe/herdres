@@ -5354,5 +5354,307 @@ class InlineSpanAndSpacingTests(unittest.TestCase):
         self.assertIn("</p><br><p>", html)
 
 
+class AttachmentTests(unittest.TestCase):
+    def _attachment(self, **over):
+        a = {"kind": "document", "file_id": "FILEID", "file_name": "report.pdf",
+             "mime_type": "application/pdf", "file_size": 11}
+        a.update(over)
+        return a
+
+    def _payload(self, **over):
+        p = {"chat_id": "-1001", "topic_id": "77", "user_id": "42", "message_id": "9",
+             "attachment": self._attachment(), "caption": "please review", "text": ""}
+        p.update(over)
+        return p
+
+    # --- pure helpers --------------------------------------------------------
+
+    def test_attachment_dest_path_sanitizes_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            herdres, "state_path", Mock(return_value=Path(tmp) / "state.json")
+        ):
+            safe_dir = herdres.attachment_dest_dir("pane-1")
+            for evil in ["../../.ssh/authorized_keys", "/etc/cron.d/x", "..", "\x00evil", "a/b/c.txt"]:
+                path = herdres.attachment_dest_path("pane-1", self._attachment(file_name=evil))
+                self.assertEqual(path.parent, safe_dir)
+                self.assertNotIn("/", path.name)
+                self.assertNotIn("..", path.name)
+                self.assertFalse(path.name.startswith("."))
+
+    def test_attachment_dest_path_unique_per_call(self) -> None:
+        # Same file_id twice must not collide (else a failed retry's cleanup could
+        # unlink the earlier delivered file).
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            herdres, "state_path", Mock(return_value=Path(tmp) / "state.json")
+        ):
+            att = self._attachment()
+            p1 = herdres.attachment_dest_path("pane-1", att)
+            p2 = herdres.attachment_dest_path("pane-1", att)
+            self.assertNotEqual(p1, p2)
+
+    def test_attachment_dest_dir_is_private(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            herdres, "state_path", Mock(return_value=Path(tmp) / "state.json")
+        ):
+            d = herdres.attachment_dest_dir("pane-1")
+            self.assertTrue(d.is_dir())
+            self.assertEqual(d.stat().st_mode & 0o777, 0o700)
+
+    def test_download_dry_run_writes_placeholder_0600(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            herdres.os.environ, {"HERDR_TELEGRAM_TOPICS_DRY_RUN": "1"}
+        ):
+            dest = Path(tmp) / "f.bin"
+            n = herdres.download_telegram_file("documents/file_0.bin", dest)
+            self.assertTrue(dest.exists())
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(n, dest.stat().st_size)
+            self.assertIn(b"dry-run", dest.read_bytes())
+
+    def test_download_enforces_byte_cap_and_uses_file_host(self) -> None:
+        captured = {}
+
+        class _Resp:
+            def __init__(self):
+                self._sent = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n=-1):
+                if self._sent:
+                    return b""
+                self._sent = True
+                return b"x" * 100
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            return _Resp()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            herdres, "telegram_token", Mock(return_value="TOKEN")
+        ), patch.object(herdres.urllib.request, "urlopen", fake_urlopen):
+            dest = Path(tmp) / "f.bin"
+            with self.assertRaises(herdres.BridgeError):
+                herdres.download_telegram_file("documents/file_0.bin", dest, max_bytes=10)
+            self.assertFalse(dest.exists())  # partial unlinked
+        self.assertIn("/file/botTOKEN/", captured["url"])  # separate file host, not the bot-API host
+
+    def test_telegram_get_file_dry_run(self) -> None:
+        with patch.dict(herdres.os.environ, {"HERDR_TELEGRAM_TOPICS_DRY_RUN": "1"}):
+            result = herdres.telegram_get_file("FILEID")
+        self.assertIn("file_path", result)
+
+    def test_instruction_document_with_caption(self) -> None:
+        instr = herdres.pane_attachment_instruction(
+            Path("/x/y/report.pdf"), self._attachment(), "please review section 3"
+        )
+        self.assertIn("/x/y/report.pdf", instr)
+        self.assertIn("original name: report.pdf", instr)
+        self.assertIn("application/pdf", instr)
+        self.assertIn("Caption: please review section 3", instr)
+
+    def test_instruction_photo_omits_original_name(self) -> None:
+        instr = herdres.pane_attachment_instruction(
+            Path("/x/p.jpg"),
+            self._attachment(kind="photo", file_name="", mime_type="image/jpeg", file_size=2400),
+            "",
+        )
+        self.assertNotIn("original name", instr)
+        self.assertIn("(photo)", instr)
+        self.assertIn("treat its contents", instr)
+
+    def test_deliver_rejects_oversize_without_getfile(self) -> None:
+        api = Mock()
+        with patch.object(herdres, "telegram_api", api):
+            ok, detail, path = herdres.deliver_attachment(
+                "pane-1", self._attachment(file_size=21 * 1024 * 1024)
+            )
+        self.assertFalse(ok)
+        self.assertIn("too large", detail)
+        self.assertIn("20 MB", detail)
+        self.assertIsNone(path)
+        api.assert_not_called()
+
+    def test_deliver_getfile_failure(self) -> None:
+        with patch.object(herdres, "telegram_get_file", Mock(side_effect=herdres.BridgeError("bad file_id"))):
+            ok, detail, path = herdres.deliver_attachment("pane-1", self._attachment())
+        self.assertFalse(ok)
+        self.assertIsNone(path)
+        self.assertIn("bad file_id", detail)
+
+    def test_download_redacts_token_and_quotes_path(self) -> None:
+        token = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            raise herdres.urllib.error.URLError(f"failed: {request.full_url}")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            herdres, "telegram_token", Mock(return_value=token)
+        ), patch.object(herdres.urllib.request, "urlopen", fake_urlopen):
+            dest = Path(tmp) / "f.bin"
+            with self.assertRaises(herdres.BridgeError) as ctx:
+                herdres.download_telegram_file("docs/a b.bin", dest)
+            self.assertNotIn(token, str(ctx.exception))
+            self.assertNotIn("ABCDEFGHIJKLMNOP", str(ctx.exception))
+            self.assertFalse(dest.exists())
+            self.assertFalse((Path(tmp) / "f.bin.part").exists())  # partial cleaned up
+        self.assertIn(f"/file/bot{token}/", captured["url"])
+        self.assertIn("docs/a%20b.bin", captured["url"])  # path is URL-quoted
+
+    def test_download_429_raises_ratelimited(self) -> None:
+        def fake_urlopen(request, timeout=None):
+            raise herdres.urllib.error.HTTPError(
+                request.full_url, 429, "Too Many Requests", {"Retry-After": "7"}, None
+            )
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            herdres, "telegram_token", Mock(return_value="T")
+        ), patch.object(herdres.urllib.request, "urlopen", fake_urlopen):
+            dest = Path(tmp) / "f.bin"
+            with self.assertRaises(herdres.RateLimited) as ctx:
+                herdres.download_telegram_file("docs/x.bin", dest)
+            self.assertEqual(ctx.exception.retry_after, 7)
+            self.assertFalse(dest.exists())
+
+    def test_attachment_dest_dir_rejects_symlink_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "share"
+            base.mkdir()
+            target = Path(tmp) / "elsewhere"
+            target.mkdir()
+            (base / "attachments").symlink_to(target)
+            with patch.object(herdres, "state_path", Mock(return_value=base / "state.json")):
+                with self.assertRaises(herdres.BridgeError):
+                    herdres.attachment_dest_dir("pane-1")
+
+    def test_prune_keeps_recent_and_drops_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i in range(5):
+                p = root / f"f{i}.bin"
+                p.write_bytes(b"x")
+                herdres.os.utime(p, (i, i))
+            (root / "stale.part").write_bytes(b"p")
+            herdres.prune_attachment_dir(root, keep=2)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["f3.bin", "f4.bin"])
+
+    def test_deliver_rejects_size_mismatch(self) -> None:
+        # confirmed size says 5000 but the wire delivers fewer bytes -> reject.
+        def fake_urlopen(request, timeout=None):
+            class _R:
+                def __init__(self_inner):
+                    self_inner._sent = False
+
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+
+                def read(self_inner, n=-1):
+                    if self_inner._sent:
+                        return b""
+                    self_inner._sent = True
+                    return b"short"
+            return _R()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            herdres, "state_path", Mock(return_value=Path(tmp) / "state.json")
+        ), patch.object(
+            herdres, "telegram_get_file", Mock(return_value={"file_path": "docs/x.bin", "file_size": 5000})
+        ), patch.object(herdres, "telegram_token", Mock(return_value="T")), patch.object(
+            herdres.urllib.request, "urlopen", fake_urlopen
+        ):
+            ok, detail, path = herdres.deliver_attachment("pane-1", self._attachment(file_size=0))
+            leftover = list((Path(tmp) / "attachments" / "pane-1").glob("*"))
+        self.assertFalse(ok)
+        self.assertIn("incomplete", detail)
+        self.assertIsNone(path)
+        self.assertEqual(leftover, [])  # mismatched file unlinked
+
+    # --- command_reply integration -------------------------------------------
+
+    def test_command_reply_delivers_document(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"].pop("active_prompt", None)
+        sent = Mock(return_value=(True, ""))
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            herdres.os.environ, {"HERDR_TELEGRAM_TOPICS_DRY_RUN": "1"}
+        ), patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            state_path=Mock(return_value=Path(tmp) / "state.json"),
+            send_to_pane=sent,
+        ):
+            result = herdres.command_reply(self._payload())
+            # Glob inside the with-block: the temp dir is removed on exit.
+            files = list((Path(tmp) / "attachments" / "pane-1").glob("*"))
+            file_mode = files[0].stat().st_mode & 0o777 if files else None
+        self.assertEqual(result["reply"], "Sent attachment to this pane.")
+        sent.assert_called_once()
+        instruction = sent.call_args.args[1]
+        self.assertIn("saved at", instruction)
+        self.assertIn("please review", instruction)
+        self.assertEqual(len(files), 1)
+        self.assertEqual(file_mode, 0o600)
+
+    def test_command_reply_attachment_owner_gate(self) -> None:
+        state = callback_state()
+        deliver = Mock()
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            deliver_attachment=deliver,
+        ):
+            result = herdres.command_reply(self._payload(user_id="99"))
+        self.assertEqual(result["reply"], "")
+        deliver.assert_not_called()
+
+    def test_command_reply_attachment_oversize_skips_getfile(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"].pop("active_prompt", None)
+        api = Mock()
+        sent = Mock(return_value=(True, ""))
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            telegram_api=api,
+            send_to_pane=sent,
+        ):
+            result = herdres.command_reply(
+                self._payload(attachment=self._attachment(file_size=21 * 1024 * 1024))
+            )
+        self.assertIn("too large", result["reply"])
+        api.assert_not_called()
+        sent.assert_not_called()
+
+    def test_command_reply_attachment_pane_closed(self) -> None:
+        state = callback_state()
+        state["panes"]["pane-1"]["last_known_status"] = "closed"
+        deliver = Mock()
+        with patch.multiple(
+            herdres,
+            load_dotenv=Mock(),
+            load_state=Mock(return_value=state),
+            save_state=Mock(),
+            deliver_attachment=deliver,
+        ):
+            result = herdres.command_reply(self._payload())
+        self.assertIn("closed or unavailable", result["reply"])
+        deliver.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

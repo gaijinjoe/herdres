@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import http.client
 import time
 import urllib.error
 import urllib.parse
@@ -118,6 +119,20 @@ CLEAN_ATTEMPT_TTL_SECONDS = int(os.getenv("HERDR_TELEGRAM_TOPICS_CLEAN_ATTEMPT_T
 PANE_INPUT_FILE_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_CHARS", "1200"))
 PANE_INPUT_FILE_LINES = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_LINES", "6"))
 PANE_INPUT_FILE_MAX_CHARS = int(os.getenv("HERDR_TELEGRAM_TOPICS_INPUT_FILE_MAX_CHARS", "120000"))
+# Inbound Telegram attachments (documents/photos). 20MB is the Bot API getFile
+# hard ceiling; the download timeout is kept under the bridge's 25s subprocess
+# kill so a slow/huge fetch fails cleanly instead of wedging the state lock.
+ATTACHMENT_MAX_BYTES = int(os.getenv("HERDR_TELEGRAM_TOPICS_ATTACHMENT_MAX_BYTES", str(20 * 1024 * 1024)))
+ATTACHMENT_FILE_HOST = os.getenv("HERDR_TELEGRAM_TOPICS_FILE_HOST", "https://api.telegram.org")
+# Socket timeout AND a wall-clock total budget for the download, kept well under
+# the bridge's 25s subprocess kill so a slow fetch fails cleanly (no orphan
+# "complete" file: we stream to a .part and atomically rename only on success).
+ATTACHMENT_DOWNLOAD_TIMEOUT = int(os.getenv("HERDR_TELEGRAM_TOPICS_ATTACHMENT_TIMEOUT", "12"))
+# Per-read socket timeout, kept below the total budget so a single stalled read
+# cannot overrun it: worst case ~= DOWNLOAD_TIMEOUT + READ_TIMEOUT, still < 25s.
+ATTACHMENT_READ_TIMEOUT = int(os.getenv("HERDR_TELEGRAM_TOPICS_ATTACHMENT_READ_TIMEOUT", "8"))
+ATTACHMENT_CHUNK_BYTES = 65536
+ATTACHMENT_KEEP_PER_PANE = int(os.getenv("HERDR_TELEGRAM_TOPICS_ATTACHMENT_KEEP", "20"))
 VISIBLE_CHOICE_SELECT_MODE = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_SELECT_MODE", "number").strip().lower()
 VISIBLE_CHOICE_NUMBER_ENTER = os.getenv("HERDR_TELEGRAM_TOPICS_VISIBLE_CHOICE_NUMBER_ENTER", "1").lower() in {
     "1",
@@ -136,6 +151,7 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)\b(bot_token|token|api[_-]?key|secret|password|passwd|authorization)\s*[:=]\s*([^\s]+)"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/\-]+=*"),
     re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"(?i)bot\d{6,}:[A-Za-z0-9_-]{20,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
     re.compile(r"(?i)([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)"),
@@ -4122,6 +4138,185 @@ def submit_staged_pane_input_if_needed(pane_id: str, *, timeout: int = 8) -> tup
     return True, ""
 
 
+def telegram_get_file(file_id: str) -> dict[str, Any]:
+    response = telegram_api("getFile", {"file_id": str(file_id)})
+    result = response.get("result") if isinstance(response, dict) else None
+    if not isinstance(result, dict) or not str(result.get("file_path") or ""):
+        raise BridgeError("Telegram getFile returned no file_path")
+    return result
+
+
+def download_telegram_file(file_path: str, dest_path: Path, *, max_bytes: int = ATTACHMENT_MAX_BYTES) -> int:
+    # Stream to a sibling <name>.part then atomically rename to the final name on
+    # success, so a SIGKILL (the bridge kills the subprocess at ~25s) can only
+    # leave a .part that is never handed to the agent. O_EXCL|O_NOFOLLOW refuses
+    # to follow/overwrite a pre-planted symlink or existing file at the .part
+    # name. The byte cap and a wall-clock deadline are both enforced on the bytes
+    # actually read (Content-Length / Telegram's declared size are never trusted).
+    part_path = dest_path.with_name(dest_path.name + ".part")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(part_path, flags, 0o600)
+    written = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            if dry_run_enabled():
+                placeholder = b"[dry-run telegram attachment]\n"
+                out.write(placeholder)
+                written = len(placeholder)
+            else:
+                token = telegram_token()
+                url = f"{ATTACHMENT_FILE_HOST}/file/bot{token}/{urllib.parse.quote(str(file_path), safe='/')}"
+                deadline = time.monotonic() + ATTACHMENT_DOWNLOAD_TIMEOUT
+                try:
+                    request = urllib.request.Request(url, method="GET")
+                    with urllib.request.urlopen(request, timeout=ATTACHMENT_READ_TIMEOUT) as resp:
+                        while True:
+                            if time.monotonic() > deadline:
+                                raise BridgeError("attachment download exceeded the time budget")
+                            chunk = resp.read(ATTACHMENT_CHUNK_BYTES)
+                            if not chunk:
+                                break
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise BridgeError("attachment exceeds the size cap")
+                            out.write(chunk)
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 429:
+                        try:
+                            retry_after = int(exc.headers.get("Retry-After") or 1)
+                        except (TypeError, ValueError):
+                            retry_after = 1
+                        raise RateLimited(retry_after) from exc
+                    raise BridgeError(f"attachment download failed: HTTP {exc.code}") from exc
+                except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+                    # Scrub the token explicitly (the URL embeds it) before it can
+                    # reach any reply or log, in addition to SECRET_PATTERNS.
+                    detail = sanitize_text(str(exc).replace(token, "REDACTED"), 200)
+                    raise BridgeError(f"attachment download failed: {detail}") from exc
+        os.replace(part_path, dest_path)
+        return written
+    except BaseException:
+        _unlink_quietly(part_path)
+        _unlink_quietly(dest_path)
+        raise
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def attachment_dest_dir(pane_id: str) -> Path:
+    base = state_path().parent / "attachments"
+    root = base / safe_file_component(pane_id)
+    # Reject a pre-planted symlink at any level so writes cannot be redirected
+    # outside the attachment tree (O_EXCL only guards the final leaf name).
+    for ancestor in (base, root):
+        if ancestor.is_symlink():
+            raise BridgeError("attachment directory path is unsafe (symlink)")
+    base.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+    for directory in (base, root):
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+    return root
+
+
+def prune_attachment_dir(root: Path, *, keep: int = ATTACHMENT_KEEP_PER_PANE) -> None:
+    """Bound a pane's attachment dir: drop stale .part files and keep only the
+    most recent `keep` finished files so a sub-cap flood cannot fill the disk."""
+    try:
+        entries = [p for p in root.iterdir() if p.is_file() and not p.is_symlink()]
+    except OSError:
+        return
+    for part in (p for p in entries if p.name.endswith(".part")):
+        _unlink_quietly(part)
+    finals = [p for p in entries if not p.name.endswith(".part")]
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for stale in sorted(finals, key=_mtime, reverse=True)[keep:]:
+        _unlink_quietly(stale)
+
+
+def attachment_dest_path(pane_id: str, attachment: dict[str, Any]) -> Path:
+    # The attacker-controlled file_name is NEVER joined as a path: basename strips
+    # any directory part, safe_file_component allowlists [A-Za-z0-9_.-], and a
+    # UTC stamp + sha256(file_id)[:12] prefix guarantees a unique, traversal-free
+    # leaf so O_EXCL never collides on legitimate traffic.
+    kind = str(attachment.get("kind") or "")
+    raw_name = os.path.basename(str(attachment.get("file_name") or ""))
+    safe = safe_file_component(raw_name, fallback=("photo" if kind == "photo" else "attachment"))
+    if kind == "photo" and not safe.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        safe = f"{safe}.jpg"
+    digest = hashlib.sha256(str(attachment.get("file_id") or "").encode("utf-8")).hexdigest()[:12]
+    # Microseconds + a random nonce make every destination unique, so re-sending
+    # the same file_id twice in one second cannot collide (which would let a
+    # failed retry's cleanup unlink the earlier, successfully delivered file).
+    stamp = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    nonce = os.urandom(4).hex()
+    return attachment_dest_dir(pane_id) / f"{stamp}-{nonce}-{digest}-{safe}"
+
+
+def pane_attachment_instruction(path: Path, attachment: dict[str, Any], caption: str) -> str:
+    kind = str(attachment.get("kind") or "")
+    mime = sanitize_text(str(attachment.get("mime_type") or ""), 120).strip()
+    size = int(attachment.get("file_size") or 0)
+    caption_clean = sanitize_text(re.sub(r"\s+", " ", str(caption or "").strip()), 420)
+    descriptor: list[str] = []
+    if kind != "photo":
+        raw_name = sanitize_text(str(attachment.get("file_name") or ""), 200).strip()
+        if raw_name:
+            descriptor.append(f"original name: {raw_name}")
+        if mime:
+            descriptor.append(f"type: {mime}")
+    else:
+        descriptor.append(f"type: {mime or 'image/jpeg'} (photo)")
+    descriptor.append(f"{size} bytes")
+    head = (
+        "Telegram topic attachment received. "
+        f"A file the owner sent is saved at {path} ({', '.join(descriptor)}). "
+    )
+    if caption_clean:
+        return head + (
+            "Read that file and treat the caption below as the owner's instruction about it; "
+            "then respond to the owner.\n"
+            f"Caption: {caption_clean}"
+        )
+    return head + "Read that file and treat its contents as the owner's instruction; then respond to the owner."
+
+
+def deliver_attachment(pane_id: str, attachment: dict[str, Any]) -> tuple[bool, str, Path | None]:
+    cap_mb = ATTACHMENT_MAX_BYTES // (1024 * 1024)
+    declared = int(attachment.get("file_size") or 0)
+    if declared > ATTACHMENT_MAX_BYTES:
+        return (False, f"too large ({declared // (1024 * 1024)} MB); Telegram bots can only fetch files up to {cap_mb} MB.", None)
+    try:
+        result = telegram_get_file(str(attachment.get("file_id") or ""))
+        confirmed = int(result.get("file_size") or 0)
+        if confirmed > ATTACHMENT_MAX_BYTES:
+            return (False, f"too large ({confirmed // (1024 * 1024)} MB); Telegram bots can only fetch files up to {cap_mb} MB.", None)
+        dest = attachment_dest_path(pane_id, attachment)
+        written = download_telegram_file(str(result.get("file_path") or ""), dest)
+        if confirmed > 0 and written != confirmed and not dry_run_enabled():
+            _unlink_quietly(dest)
+            return (False, "the download was incomplete (size mismatch); please resend.", None)
+        prune_attachment_dir(dest.parent)
+    except RateLimited:
+        raise
+    except (BridgeError, OSError) as exc:
+        return (False, sanitize_text(str(exc), 300), None)
+    return (True, "", dest)
+
+
 def visible_choice_selection_keys(choice: str) -> list[str]:
     choice = str(choice or "").strip()
     if VISIBLE_CHOICE_SELECT_MODE in {"number", "numbers", "digit", "digits"}:
@@ -4288,6 +4483,8 @@ def dry_run_result(method: str, payload: dict[str, Any]) -> dict[str, Any]:
                 {"emoji": "❓", "custom_emoji_id": "dry-unknown"},
             ],
         }
+    if method == "getFile":
+        return {"ok": True, "result": {"file_id": str(payload.get("file_id", "")), "file_path": "documents/file_0.bin", "file_size": 11}}
     if method in {"sendMessage", "sendRichMessage", "editMessageText"}:
         return {"ok": True, "result": {"message_id": now_id}}
     return {"ok": True, "result": True}
@@ -5862,6 +6059,18 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
     pane_id = str(entry.get("pane_id") or "")
     if not pane_id or entry.get("last_known_status") == "closed":
         return {"handled": True, "reply": "This topic is mapped to a closed or unavailable Herdr pane."}
+
+    attachment = payload.get("attachment")
+    if isinstance(attachment, dict) and attachment.get("kind") in {"document", "photo"} and attachment.get("file_id"):
+        caption = str(payload.get("caption") or "")
+        ok, detail, dest = deliver_attachment(pane_id, attachment)
+        if not ok or dest is None:
+            return {"handled": True, "reply": f"Could not deliver that attachment: {detail}"}
+        instruction = pane_attachment_instruction(dest, attachment, caption or text)
+        sent_ok, sent_detail = send_to_pane(pane_id, instruction)
+        if not sent_ok:
+            return {"handled": True, "reply": f"Send failed: {sanitize_text(sent_detail, 300)}"}
+        return {"handled": True, "reply": "Sent attachment to this pane."}
 
     command, arg = parse_command(text)
     if command == "plain":

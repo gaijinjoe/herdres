@@ -122,9 +122,47 @@ async def _run_command_script(payload: dict[str, Any], mode: str = "command") ->
         return {"handled": True, "reply": "Herdr topic command returned invalid output."}
 
 
+def _attachment_payload(message: Any) -> dict[str, Any] | None:
+    """Extract one attachment (document preferred, else largest photo) as a
+    JSON-safe dict via getattr only. No Telegram calls, no token. Returns None
+    when there is no usable attachment; never raises on a malformed object."""
+    try:
+        document = getattr(message, "document", None)
+        if document is not None:
+            file_id = str(getattr(document, "file_id", "") or "")
+            if file_id:
+                return {
+                    "kind": "document",
+                    "file_id": file_id,
+                    "file_name": str(getattr(document, "file_name", "") or ""),
+                    "mime_type": str(getattr(document, "mime_type", "") or ""),
+                    "file_size": int(getattr(document, "file_size", 0) or 0),
+                }
+        photo = getattr(message, "photo", None)
+        if photo:
+            largest = photo[-1]
+            file_id = str(getattr(largest, "file_id", "") or "")
+            if file_id:
+                return {
+                    "kind": "photo",
+                    "file_id": file_id,
+                    "file_name": "",
+                    "mime_type": "image/jpeg",
+                    "file_size": int(getattr(largest, "file_size", 0) or 0),
+                }
+    except Exception:
+        return None
+    return None
+
+
 async def maybe_handle_herdr_topic_message(adapter: Any, message: Any) -> bool:
     """Handle a Telegram message if it belongs to a mapped Herdr pane topic."""
-    if not getattr(message, "text", None):
+    text = getattr(message, "text", None)
+    attachment = _attachment_payload(message)
+    # Gate on text or a supported attachment only: a caption rides with its
+    # attachment, but a caption on unsupported media (video/voice/...) must fall
+    # through so the host bot handles it normally instead of being swallowed.
+    if not (text or attachment):
         return False
     state = _load_state()
     if not state:
@@ -134,17 +172,28 @@ async def maybe_handle_herdr_topic_message(adapter: Any, message: Any) -> bool:
         return False
 
     user = getattr(message, "from_user", None)
+    user_id = str(getattr(user, "id", "") if user else "")
+    from_bot = bool(getattr(user, "is_bot", False)) if user else True
+    # Cheap owner pre-filter so non-owner / bot traffic in a mapped topic does
+    # not spawn the herdres subprocess (it would just be dropped there anyway).
+    # command_reply re-applies the authoritative gate. Only filter when owners
+    # are configured in state; otherwise defer entirely to command_reply.
+    owners = {str(x) for x in (state.get("telegram") or {}).get("owner_user_ids", [])}
+    if from_bot or (owners and user_id not in owners):
+        return True
     reply_to = getattr(message, "reply_to_message", None)
     payload = {
         "chat_id": str(getattr(getattr(message, "chat", None), "id", "")),
         "topic_id": _message_thread_id(message),
         "message_id": str(getattr(message, "message_id", "")),
         "reply_to_message_id": str(getattr(reply_to, "message_id", "") if reply_to else ""),
-        "user_id": str(getattr(user, "id", "") if user else ""),
-        "from_bot": bool(getattr(user, "is_bot", False)) if user else True,
+        "user_id": user_id,
+        "from_bot": from_bot,
         "forwarded": _is_forwarded(message),
         "edited": bool(getattr(message, "edit_date", None)),
         "text": str(getattr(message, "text", "") or ""),
+        "caption": str(getattr(message, "caption", "") or ""),
+        "attachment": attachment,
     }
     try:
         result = await _run_command_script(payload)
