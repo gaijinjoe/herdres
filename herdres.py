@@ -4034,41 +4034,21 @@ def status_marker_hash(pane: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-STATUS_ICON_ENV_KEYS = {
-    "working": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING",
-    "idle": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE",
-    "done": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE",
-    "blocked": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED",
-    "error": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR",
-    "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW",
-    "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN",
-    "closed": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED",
-    "goal": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_GOAL",
-}
+STATUS_ICON_TABLE = (
+    ("working", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING_EMOJI", "⚡️"),
+    ("idle", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE_EMOJI", "☕️"),
+    ("done", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE_EMOJI", "✅"),
+    ("blocked", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED_EMOJI", "❗️"),
+    ("error", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR_EMOJI", "‼️"),
+    ("workflow", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW_EMOJI", "📈"),
+    ("unknown", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN_EMOJI", "❓"),
+    ("closed", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED_EMOJI", "📁"),
+    ("goal", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_GOAL", "HERDR_TELEGRAM_TOPICS_STATUS_ICON_GOAL_EMOJI", "🧠"),
+)
 
-STATUS_ICON_EMOJI_ENV_KEYS = {
-    "working": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING_EMOJI",
-    "idle": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE_EMOJI",
-    "done": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE_EMOJI",
-    "blocked": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED_EMOJI",
-    "error": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR_EMOJI",
-    "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW_EMOJI",
-    "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN_EMOJI",
-    "closed": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED_EMOJI",
-    "goal": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_GOAL_EMOJI",
-}
-
-STATUS_ICON_DEFAULT_EMOJI = {
-    "working": "⚡️",
-    "idle": "☕️",
-    "done": "✅",
-    "blocked": "❗️",
-    "error": "‼️",
-    "workflow": "📈",
-    "unknown": "❓",
-    "closed": "📁",
-    "goal": "🧠",
-}
+STATUS_ICON_ENV_KEYS = {key: env_key for key, env_key, _emoji_env_key, _emoji in STATUS_ICON_TABLE}
+STATUS_ICON_EMOJI_ENV_KEYS = {key: emoji_env_key for key, _env_key, emoji_env_key, _emoji in STATUS_ICON_TABLE}
+STATUS_ICON_DEFAULT_EMOJI = {key: emoji for key, _env_key, _emoji_env_key, emoji in STATUS_ICON_TABLE}
 
 
 def pane_goal_active(pane: dict[str, Any]) -> bool:
@@ -4695,13 +4675,8 @@ def dry_run_result(method: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "ok": True,
             "result": [
-                {"emoji": "⚡️", "custom_emoji_id": "dry-working"},
-                {"emoji": "☕️", "custom_emoji_id": "dry-idle"},
-                {"emoji": "✅", "custom_emoji_id": "dry-done"},
-                {"emoji": "❗️", "custom_emoji_id": "dry-blocked"},
-                {"emoji": "‼️", "custom_emoji_id": "dry-error"},
-                {"emoji": "📈", "custom_emoji_id": "dry-workflow"},
-                {"emoji": "❓", "custom_emoji_id": "dry-unknown"},
+                {"emoji": emoji, "custom_emoji_id": f"dry-{key}"}
+                for key, emoji in STATUS_ICON_DEFAULT_EMOJI.items()
             ],
         }
     if method == "getFile":
@@ -4784,6 +4759,17 @@ def classify_telegram_error(exc: Exception) -> str:
         or "message can't be edited" in text
     ):
         return "not_found"
+    if (
+        "unauthorized" in text
+        or "forbidden" in text
+        or "bot was blocked by the user" in text
+        or "bot blocked" in text
+        or "user is deactivated" in text
+        or "chat not found" in text
+        or "bot is not a member" in text
+        or "was kicked" in text
+    ):
+        return "permanent"
     if "bad request" in text or "can't parse" in text or "entity" in text or "unsupported" in text:
         return "bad_request"
     if any(fragment in text for fragment in ("timed out", "timeout", "temporarily", "network", "connection", "http 5")):
@@ -4895,7 +4881,11 @@ def note_rich_bad_request(telegram: dict[str, Any] | None, reason: str) -> None:
     rich = rich_telegram_state(telegram)
     if not rich:
         return
-    streak = int(rich.get("bad_request_streak") or 0) + 1
+    try:
+        streak = int(rich.get("bad_request_streak") or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    streak += 1
     rich["bad_request_streak"] = streak
     if streak >= RICH_BAD_REQUEST_LIMIT:
         mark_rich_disabled(telegram, f"repeated bad_request: {reason}")
@@ -4925,6 +4915,21 @@ def _reply_markup_payload(reply_markup: dict[str, Any] | None) -> dict[str, str]
     return {"reply_markup": json.dumps(reply_markup, separators=(",", ":"))}
 
 
+def _message_common_payload(
+    chat_id: str,
+    *,
+    thread_id: str | int | None,
+    notify: bool,
+    reply_markup: dict[str, Any] | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"chat_id": chat_id}
+    if not notify:
+        payload["disable_notification"] = "true"
+    payload.update(_thread_payload(thread_id))
+    payload.update(_reply_markup_payload(reply_markup))
+    return payload
+
+
 def send_message(
     chat_id: str,
     text: str,
@@ -4934,14 +4939,8 @@ def send_message(
     reply_markup: dict[str, Any] | None = None,
     reply_to_message_id: str | int | None = None,
 ) -> str | None:
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": sanitize_text(text, MAX_REPLY_CHARS),
-    }
-    if not notify:
-        payload["disable_notification"] = "true"
-    payload.update(_thread_payload(thread_id))
-    payload.update(_reply_markup_payload(reply_markup))
+    payload = _message_common_payload(chat_id, thread_id=thread_id, notify=notify, reply_markup=reply_markup)
+    payload["text"] = sanitize_text(text, MAX_REPLY_CHARS)
     if reply_to_message_id:
         payload["reply_to_message_id"] = str(reply_to_message_id)
     return telegram_message_id(telegram_api("sendMessage", payload))
@@ -4994,13 +4993,13 @@ def edit_message_text(
         raise
     except BridgeError as exc:
         kind = classify_telegram_error(exc)
-        result = {"ok": kind == "not_modified", "kind": kind, "error": str(exc)}
+        result = {"ok": kind == "not_modified", "format": "legacy", "kind": kind, "error": str(exc)}
         if kind == "not_found":
             result["not_found"] = True
         if kind == "topic_not_found":
             result["topic_missing"] = True
         return result
-    return {"ok": True, "kind": "edited", "message_id": telegram_message_id(response)}
+    return {"ok": True, "format": "legacy", "kind": "edited", "message_id": telegram_message_id(response)}
 
 
 _RICH_TOP_BLOCK_RE = re.compile(
@@ -5102,6 +5101,13 @@ def split_rich_html(html_text: str, limit: int) -> list[str]:
     return chunks
 
 
+def _record_rich_failure(kind: str, telegram: dict[str, Any] | None, exc: Exception) -> None:
+    if kind == "capability":
+        mark_rich_disabled(telegram, str(exc))
+    elif kind == "bad_request":
+        note_rich_bad_request(telegram, str(exc))
+
+
 def _send_rich_chunk(
     chat_id: str,
     html_text: str,
@@ -5123,17 +5129,11 @@ def _send_rich_chunk(
             reply_to_message_id=reply_to_message_id,
         )
 
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "rich_message": json.dumps(
-            {"html": html_text, "skip_entity_detection": True},
-            separators=(",", ":"),
-        ),
-    }
-    if not notify:
-        payload["disable_notification"] = "true"
-    payload.update(_thread_payload(thread_id))
-    payload.update(_reply_markup_payload(reply_markup))
+    payload = _message_common_payload(chat_id, thread_id=thread_id, notify=notify, reply_markup=reply_markup)
+    payload["rich_message"] = json.dumps(
+        {"html": html_text, "skip_entity_detection": True},
+        separators=(",", ":"),
+    )
     if reply_to_message_id:
         try:
             payload["reply_parameters"] = json.dumps({"message_id": int(reply_to_message_id)}, separators=(",", ":"))
@@ -5147,7 +5147,7 @@ def _send_rich_chunk(
     except BridgeError as exc:
         kind = classify_telegram_error(exc)
         if kind == "capability":
-            mark_rich_disabled(telegram, str(exc))
+            _record_rich_failure(kind, telegram, exc)
             result = send_legacy_message_result(
                 chat_id,
                 fallback,
@@ -5159,7 +5159,7 @@ def _send_rich_chunk(
             result["fallback_reason"] = kind
             return result
         if kind == "bad_request":
-            note_rich_bad_request(telegram, str(exc))
+            _record_rich_failure(kind, telegram, exc)
             result = send_legacy_message_result(
                 chat_id,
                 fallback,
@@ -5269,6 +5269,7 @@ def send_feed_item(
         chat_id,
         render_feed_item_html(item, live=live),
         telegram=telegram,
+        fallback_text=item_plain_text(item),
         thread_id=thread_id,
         notify=notify,
         reply_markup=reply_markup,
@@ -5290,6 +5291,7 @@ def edit_feed_item(
         message_id,
         render_feed_item_html(item, live=live),
         telegram=telegram,
+        fallback_text=item_plain_text(item),
         reply_markup=reply_markup,
     )
 
@@ -5338,7 +5340,7 @@ def update_live_card(
         ).encode("utf-8")
     ).hexdigest()
     if card_hash == entry.get("card_hash") and entry.get("card_message_id"):
-        return {"ok": True, "kind": "unchanged", "attempted": False}
+        return {"ok": True, "format": str(entry.get("card_format") or "legacy"), "kind": "unchanged", "attempted": False}
 
     message_id = str(entry.get("card_message_id") or "")
     if message_id:
@@ -5351,7 +5353,7 @@ def update_live_card(
         )
         if result.get("ok"):
             entry["card_hash"] = card_hash
-            entry["card_format"] = str(result.get("format") or ("legacy" if not rich_enabled(telegram) else "rich"))
+            entry["card_format"] = str(result.get("format") or "legacy")
             return {**result, "attempted": True}
         if not result.get("not_found"):
             return {**result, "attempted": True}

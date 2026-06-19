@@ -1696,6 +1696,21 @@ What changed:
         self.assertEqual(herdres.classify_telegram_error(error), "topic_not_found")
         self.assertTrue(herdres.result_topic_missing({"ok": False, "kind": "topic_not_found"}))
 
+    def test_classifies_well_known_permanent_telegram_errors(self) -> None:
+        cases = [
+            "Telegram sendMessage failed: Unauthorized",
+            "Telegram sendMessage failed: Forbidden: bot was blocked by the user",
+            "Telegram sendMessage failed: Bad Request: chat not found",
+            "Telegram sendMessage failed: Forbidden: bot is not a member of the supergroup chat",
+        ]
+        for message in cases:
+            with self.subTest(message=message):
+                self.assertEqual(herdres.classify_telegram_error(herdres.BridgeError(message)), "permanent")
+        self.assertEqual(
+            herdres.classify_telegram_error(herdres.BridgeError("Telegram sendMessage failed: timed out")),
+            "transient",
+        )
+
     def test_topic_not_modified_counts_as_verified_topic(self) -> None:
         entry = {"topic_id": "77", "topic_name": "Restored"}
 
@@ -5639,6 +5654,42 @@ class RichMessageSplitTests(unittest.TestCase):
         self.assertEqual([m for m, _ in calls], ["sendRichMessage"])
         self.assertEqual(result["format"], "rich")
 
+    def test_edit_message_text_returns_legacy_format(self) -> None:
+        with patch.object(herdres, "telegram_api", Mock(return_value={"ok": True, "result": {"message_id": 10}})):
+            result = herdres.edit_message_text("-100", "10", "updated")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["format"], "legacy")
+
+    def test_update_live_card_uses_edit_result_format(self) -> None:
+        item = herdres.make_feed_item("report", "Report", "Fixed the issue.", notify=False)
+        entry = {"card_message_id": "10"}
+        with patch.object(
+            herdres,
+            "edit_rich_message",
+            Mock(return_value={"ok": True, "format": "legacy", "kind": "edited", "message_id": "10"}),
+        ):
+            result = herdres.update_live_card("-100", entry, item, telegram={"rich_messages": {"supported": "yes"}})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["format"], "legacy")
+        self.assertEqual(entry["card_format"], "legacy")
+
+    def test_send_and_edit_feed_item_pass_plain_fallback_text(self) -> None:
+        item = herdres.make_feed_item("report", "Report", "First line\nSecond line", notify=False)
+        send_rich_message = Mock(return_value={"ok": True, "format": "legacy", "message_id": "11"})
+        edit_rich_message = Mock(return_value={"ok": True, "format": "legacy", "kind": "edited"})
+        with patch.object(herdres, "send_rich_message", send_rich_message):
+            herdres.send_feed_item("-100", item, telegram={}, thread_id="77")
+        with patch.object(herdres, "edit_rich_message", edit_rich_message):
+            herdres.edit_feed_item("-100", "11", item, telegram={})
+        self.assertEqual(send_rich_message.call_args.kwargs["fallback_text"], herdres.item_plain_text(item))
+        self.assertEqual(edit_rich_message.call_args.kwargs["fallback_text"], herdres.item_plain_text(item))
+
+    def test_note_rich_bad_request_resets_corrupt_streak(self) -> None:
+        telegram = {"rich_messages": {"supported": "yes", "bad_request_streak": "bad"}}
+        herdres.note_rich_bad_request(telegram, "bad html")
+        self.assertEqual(telegram["rich_messages"]["bad_request_streak"], 1)
+        self.assertEqual(telegram["rich_messages"]["supported"], "yes")
+
     def test_send_rich_message_reports_later_chunk_failure(self) -> None:
         html = "".join(f"<p>paragraph number {i} with filler</p>" for i in range(400))
         calls = []
@@ -5681,6 +5732,7 @@ class RichMessageSplitTests(unittest.TestCase):
         with patch.object(herdres, "telegram_api", side_effect=lambda m, p: calls.append((m, p)) or {"ok": True, "result": {"message_id": 10}}):
             result = herdres.edit_rich_message("-100", "10", "<p><b>updated</b></p>", telegram=tg)
         self.assertTrue(result["ok"])
+        self.assertEqual(result["format"], "legacy")
         self.assertEqual([m for m, _ in calls], ["editMessageText"])
         self.assertEqual(calls[0][1]["text"], "updated")
         self.assertNotIn("rich_message", calls[0][1])
@@ -6149,6 +6201,50 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
     def test_closed_status_icon_default_emoji(self) -> None:
         self.assertEqual(herdres.status_icon_emoji("closed"), "📁")
 
+    def test_status_icon_maps_match_legacy_explicit_values(self) -> None:
+        self.assertEqual(
+            herdres.STATUS_ICON_ENV_KEYS,
+            {
+                "working": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING",
+                "idle": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE",
+                "done": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE",
+                "blocked": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED",
+                "error": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR",
+                "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW",
+                "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN",
+                "closed": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED",
+                "goal": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_GOAL",
+            },
+        )
+        self.assertEqual(
+            herdres.STATUS_ICON_EMOJI_ENV_KEYS,
+            {
+                "working": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKING_EMOJI",
+                "idle": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_IDLE_EMOJI",
+                "done": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_DONE_EMOJI",
+                "blocked": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_BLOCKED_EMOJI",
+                "error": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_ERROR_EMOJI",
+                "workflow": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_WORKFLOW_EMOJI",
+                "unknown": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_UNKNOWN_EMOJI",
+                "closed": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_CLOSED_EMOJI",
+                "goal": "HERDR_TELEGRAM_TOPICS_STATUS_ICON_GOAL_EMOJI",
+            },
+        )
+        self.assertEqual(
+            herdres.STATUS_ICON_DEFAULT_EMOJI,
+            {
+                "working": "⚡️",
+                "idle": "☕️",
+                "done": "✅",
+                "blocked": "❗️",
+                "error": "‼️",
+                "workflow": "📈",
+                "unknown": "❓",
+                "closed": "📁",
+                "goal": "🧠",
+            },
+        )
+
     def test_closed_status_icon_resolves_to_custom_emoji_id(self) -> None:
         telegram = {"forum_topic_icons": {
             "by_emoji": {"📁": "id-folder", "❓": "id-unknown"},
@@ -6216,6 +6312,15 @@ class SpinnerAndWorkingPaneTests(unittest.TestCase):
         with patch.object(herdres, "pane_output", Mock(return_value="◎ /goal active (3h)")):
             self.assertEqual(herdres.status_icon_key(pane), "goal")
         self.assertEqual(herdres.status_icon_emoji("goal"), "🧠")
+
+    def test_dry_run_status_icon_stickers_include_goal_and_closed(self) -> None:
+        telegram: dict = {}
+        with patch.object(herdres, "telegram_api", Mock(side_effect=herdres.dry_run_result)):
+            cid, key, emoji = herdres.status_icon_id_for_keys(telegram, ["goal", "unknown"])
+        self.assertEqual(cid, "dry-goal")
+        self.assertEqual(key, "goal")
+        self.assertEqual(emoji, "🧠")
+        self.assertEqual(telegram["forum_topic_icons"]["by_emoji"]["📁"], "dry-closed")
 
     def test_status_icon_idle_when_goal_achieved_not_active(self) -> None:
         pane = {"pane_id": "p", "agent_status": "idle"}
