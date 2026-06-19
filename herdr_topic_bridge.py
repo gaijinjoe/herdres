@@ -29,6 +29,13 @@ def _script_path() -> Path:
     return Path(os.getenv("HERDR_TELEGRAM_TOPICS_SCRIPT", str(DEFAULT_SCRIPT))).expanduser()
 
 
+def _stand_down() -> bool:
+    # When the standalone herdres gateway owns inbound forwarding, Hermes should
+    # stop forwarding mapped-pane-topic traffic (to avoid double-handling) while
+    # still treating those topics as "handled" so it never chats inside them.
+    return os.getenv("HERDRES_BRIDGE_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _load_state() -> dict[str, Any] | None:
     path = _state_path()
     if not path.exists():
@@ -172,6 +179,8 @@ async def maybe_handle_herdr_topic_message(adapter: Any, message: Any) -> bool:
     entry = _mapped_entry(state, message)
     if not entry:
         return False
+    if _stand_down():
+        return True
 
     user = getattr(message, "from_user", None)
     user_id = str(getattr(user, "id", "") if user else "")
@@ -237,6 +246,8 @@ async def maybe_handle_herdr_topic_callback(adapter: Any, query: Any) -> bool:
     entry = _mapped_topic_entry(state, chat_id, thread_id)
     if not entry:
         return False
+    if _stand_down():
+        return True
 
     user = getattr(query, "from_user", None)
     payload = {
