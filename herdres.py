@@ -4091,6 +4091,60 @@ def status_icon_emoji(key: str) -> str:
     return (os.getenv(env_key, "") if env_key else "").strip() or STATUS_ICON_DEFAULT_EMOJI.get(key, "❓")
 
 
+PINNED_STATUS_DOTS = {
+    "idle": "🟢",
+    "done": "🟢",
+    "working": "🟡",
+    "workflow": "🟡",
+    "blocked": "🔴",
+    "error": "🔴",
+    "goal": "🧠",
+    "unknown": "⬜",
+}
+
+
+def pinned_status_enabled() -> bool:
+    return os.getenv("HERDR_TELEGRAM_TOPICS_PINNED_STATUS", "0").strip() == "1"
+
+
+def pinned_status_dot(pane: dict[str, Any]) -> str:
+    if pane_goal_active(pane):
+        return "🧠"
+    return PINNED_STATUS_DOTS.get(status_icon_key(pane), "🟡")
+
+
+def pinned_status_pane_open(pane: dict[str, Any]) -> bool:
+    status = str(pane.get("agent_status") or "").lower()
+    if status in {"closed", "exited"}:
+        return False
+    if pane.get("closed") or pane.get("exited") or pane.get("process_exited"):
+        return False
+    return True
+
+
+def pinned_status_pane_label(state: dict[str, Any], pane: dict[str, Any]) -> str:
+    entries = state.get("panes") if isinstance(state.get("panes"), dict) else {}
+    entry = entries.get(pane_key(pane)) if isinstance(entries, dict) else None
+    raw = ""
+    if isinstance(entry, dict):
+        raw = str(entry.get("topic_name") or "")
+    if not raw:
+        raw = str(pane.get("topic_name") or pane.get("name") or pane_manual_label(pane) or pane.get("pane_id") or "pane")
+    label = re.sub(r"\s+", " ", raw).strip()
+    return sanitize_text(label or "pane", 80)
+
+
+def render_pinned_status_overview(state: dict[str, Any], panes: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for pane in panes:
+        if not pinned_status_pane_open(pane):
+            continue
+        parts.append(f"{pinned_status_pane_label(state, pane)} {pinned_status_dot(pane)}")
+    if not parts:
+        return "No active panes."
+    return sanitize_text(" | ".join(parts), MAX_REPLY_CHARS)
+
+
 def status_icon_explicit_id(key: str) -> str:
     env_key = STATUS_ICON_ENV_KEYS.get(key, "")
     return (os.getenv(env_key, "") if env_key else "").strip()
@@ -5000,6 +5054,131 @@ def edit_message_text(
             result["topic_missing"] = True
         return result
     return {"ok": True, "format": "legacy", "kind": "edited", "message_id": telegram_message_id(response)}
+
+
+def pin_chat_message(chat_id: str, message_id: str | int) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": str(message_id),
+        "disable_notification": "true",
+    }
+    try:
+        response = telegram_api("pinChatMessage", payload)
+    except RateLimited:
+        raise
+    except BridgeError as exc:
+        return {"ok": False, "error": str(exc)}
+    if not response.get("ok", True):
+        return {"ok": False, "error": sanitize_text(str(response), 500)}
+    return {"ok": bool(response.get("result", True))}
+
+
+def warn_pinned_status(message: str) -> None:
+    print(f"herdres pinned status warning: {message}", file=sys.stderr)
+
+
+def _pinned_status_env_topic_id() -> str:
+    raw = os.getenv("HERDR_TELEGRAM_TOPICS_PINNED_STATUS_TOPIC_ID")
+    if raw is None:
+        return ""
+    raw = raw.strip()
+    if not raw:
+        return ""
+    try:
+        return str(int(raw))
+    except ValueError:
+        return ""
+
+
+def pinned_status_topic_id(state: dict[str, Any]) -> str:
+    # PURE: resolve the dashboard topic id from env or persisted state only.
+    # We do NOT auto-create a topic — the operator must point this at an existing
+    # forum topic via HERDR_TELEGRAM_TOPICS_PINNED_STATUS_TOPIC_ID (no surprise topic creation).
+    env_topic_id = _pinned_status_env_topic_id()
+    if env_topic_id:
+        return env_topic_id
+    telegram = state.get("telegram") if isinstance(state.get("telegram"), dict) else {}
+    return str(telegram.get("pinned_status_topic_id") or "").strip()
+
+
+def recreate_pinned_status_message(
+    state: dict[str, Any],
+    chat_id: str,
+    topic_id: str,
+    text: str,
+) -> bool:
+    telegram = state.setdefault("telegram", {})
+    if not isinstance(telegram, dict):
+        return False
+    msg_id = send_message(chat_id, text, thread_id=topic_id, notify=False)
+    if not msg_id:
+        telegram["pinned_status_last_error"] = "sendMessage returned no message_id"
+        telegram["pinned_status_last_error_at"] = utc_now()
+        return False
+    telegram["pinned_status_msg_id"] = str(msg_id)
+    telegram["pinned_status_text"] = text
+    telegram["pinned_status_topic_id"] = str(topic_id)
+    telegram.pop("pinned_status_last_error", None)
+    telegram.pop("pinned_status_last_error_at", None)
+    pin_result = pin_chat_message(chat_id, msg_id)
+    if not pin_result.get("ok"):
+        warning = sanitize_text(str(pin_result.get("error") or pin_result), 500)
+        telegram["pinned_status_pin_error"] = warning
+        telegram["pinned_status_pin_error_at"] = utc_now()
+        warn_pinned_status(warning)
+    else:
+        telegram.pop("pinned_status_pin_error", None)
+        telegram.pop("pinned_status_pin_error_at", None)
+        telegram["pinned_status_pinned_at"] = utc_now()
+    return True
+
+
+def sync_pinned_status_overview(
+    state: dict[str, Any],
+    bot_token: str,
+    chat_id: str,
+    panes: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    del bot_token
+    if not pinned_status_enabled():
+        return {"ok": True, "changed": False, "skipped": "disabled"}
+    if panes is None:
+        panes = pane_list()
+    text = render_pinned_status_overview(state, panes)
+    telegram = state.setdefault("telegram", {})
+    if not isinstance(telegram, dict):
+        return {"ok": False, "changed": False, "error": "telegram state is not a dict"}
+    # Read the previously-stored topic id BEFORE resolving, so a changed env id is
+    # detected (the resolver is pure and does not mutate state).
+    old_topic_id = str(telegram.get("pinned_status_topic_id") or "").strip()
+    topic_id = pinned_status_topic_id(state)
+    general_id = str(telegram.get("general_thread_id", DEFAULT_GENERAL_THREAD_ID) or DEFAULT_GENERAL_THREAD_ID)
+    if str(topic_id or "").strip() in {"", "0", general_id}:
+        warn_pinned_status("no dashboard topic set (HERDR_TELEGRAM_TOPICS_PINNED_STATUS_TOPIC_ID unset or General); skipping")
+        return {"ok": True, "changed": False, "skipped": "no_topic"}
+    if old_topic_id and old_topic_id != str(topic_id):
+        telegram.pop("pinned_status_msg_id", None)
+        telegram.pop("pinned_status_text", None)
+    telegram["pinned_status_topic_id"] = str(topic_id)
+    msg_id = telegram.get("pinned_status_msg_id")
+    if msg_id and str(telegram.get("pinned_status_text") or "") == text:
+        return {"ok": True, "changed": False, "skipped": "unchanged"}
+    if not msg_id:
+        return {"ok": True, "changed": recreate_pinned_status_message(state, chat_id, str(topic_id), text)}
+    result = edit_message_text(chat_id, msg_id, text)
+    if result.get("ok"):
+        telegram["pinned_status_text"] = text
+        telegram["pinned_status_topic_id"] = str(topic_id)
+        telegram.pop("pinned_status_last_error", None)
+        telegram.pop("pinned_status_last_error_at", None)
+        return {"ok": True, "changed": result.get("kind") != "not_modified"}
+    if result.get("not_found") or result.get("kind") in {"not_found", "message_not_found"}:
+        telegram.pop("pinned_status_msg_id", None)
+        telegram.pop("pinned_status_text", None)
+        return {"ok": True, "changed": recreate_pinned_status_message(state, chat_id, str(topic_id), text)}
+    telegram["pinned_status_last_error"] = sanitize_text(str(result.get("error") or result), 500)
+    telegram["pinned_status_last_error_at"] = utc_now()
+    return {"ok": False, "changed": False, "error": telegram["pinned_status_last_error"]}
 
 
 _RICH_TOP_BLOCK_RE = re.compile(
@@ -6069,6 +6248,10 @@ def sync_once() -> dict[str, Any]:
             sends += 1
 
     if not panes:
+        if pinned_status_enabled():
+            overview = sync_pinned_status_overview(state, "", chat_id, panes)
+            if overview.get("changed"):
+                changed = True
         state["last_sync_empty_at"] = utc_now()
         save_state(state)
         return {"ok": True, "changed": changed, "panes": 0, "sent": sends, "message": "no agent panes"}
@@ -6126,6 +6309,10 @@ def sync_once() -> dict[str, Any]:
     }
     for pane in panes:
         if sync_pane_once(state, chat_id, telegram, pane, counters, caps):
+            changed = True
+    if pinned_status_enabled():
+        overview = sync_pinned_status_overview(state, "", chat_id, panes)
+        if overview.get("changed"):
             changed = True
     sends = counters["sends"]
     creates = counters["creates"]
